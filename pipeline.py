@@ -115,6 +115,55 @@ def _rect_center_inside(bbox, rect: fitz.Rect) -> bool:
     return rect.contains(fitz.Point(cx, cy))
 
 
+# Area minima (pt^2) pra um desenho vetorial contar como "conteudo visual de
+# verdade" (logo, icone, ilustracao) — abaixo disso e uma linha fina de
+# sublinhado/moldura, ruido demais pra alertar.
+AREA_MINIMA_DESENHO_PROTEGIDO = 200
+# Sobreposicao minima (pt^2) pra considerar que um bloco de texto realmente
+# invade a area protegida, e nao so encosta na borda por causa de arredondamento.
+SOBREPOSICAO_MINIMA_ALERTA = 4
+
+
+def _avisar_colisao_com_conteudo_visual(
+    page: fitz.Page, block_infos: list[dict], table_areas: list[fitz.Rect]
+) -> None:
+    """Antes de redatar qualquer coisa, avisa se a bbox de um bloco de texto
+    normal (fora de tabela) invade uma imagem ou um desenho grande o
+    suficiente pra ser conteudo de verdade. Foi assim que a logo do rodape
+    e a borda da tabela foram apagadas por engano — agora fica visivel no
+    log ANTES de gerar o arquivo, em vez de descoberto so comparando PDFs.
+    Tabelas ficam de fora da checagem porque suas bordas ja sao redesenhadas
+    de proposito depois (ver loop de `table_cell_rects` mais abaixo)."""
+    protegidos = [fitz.Rect(img["bbox"]) for img in page.get_image_info()]
+    for d in page.get_drawings():
+        rect = fitz.Rect(d["rect"])
+        if rect.get_area() < AREA_MINIMA_DESENHO_PROTEGIDO:
+            continue
+        if any(_rect_center_inside(tuple(rect), area) for area in table_areas):
+            continue  # borda de tabela — tratada a parte, nao e bug
+        fill = d.get("fill")
+        if fill and all(c > 0.98 for c in fill) and not d.get("color"):
+            continue  # retangulo branco de fundo — redatar em branco nao muda nada
+        protegidos.append(rect)
+
+    for info in block_infos:
+        if info["tabela"]:
+            continue
+        bbox = fitz.Rect(info["bbox"])
+        for protegido in protegidos:
+            sobreposicao = bbox & protegido
+            if sobreposicao.is_empty:
+                continue
+            area = sobreposicao.get_area()
+            if area > SOBREPOSICAO_MINIMA_ALERTA:
+                print(
+                    f"[ALERTA] pagina {page.number}: bloco de texto "
+                    f"{tuple(round(v, 1) for v in bbox)} invade area visual protegida "
+                    f"{tuple(round(v, 1) for v in protegido)} (sobreposicao {area:.1f}pt^2) "
+                    f"— revisar o PDF final antes de confiar no resultado"
+                )
+
+
 def _merged_lines_runs(blocks: list[dict]) -> list[list[list]]:
     """Junta as linhas de varios blocos (ex.: todos os blocos dentro de uma
     celula de tabela) numa unica lista de linhas com runs por negrito."""
@@ -183,6 +232,7 @@ def process_pdf(
                     "run_indices": run_indices,
                     "size": size,
                     "color": color,
+                    "tabela": True,
                 }
             )
 
@@ -208,11 +258,14 @@ def process_pdf(
                     "run_indices": run_indices,
                     "size": first_span["size"],
                     "color": first_span["color"],
+                    "tabela": False,
                 }
             )
 
         if not block_infos:
             continue
+
+        _avisar_colisao_com_conteudo_visual(page, block_infos, table_areas)
 
         flat_translations = translate_batch(flat_originals, source_lang, target_lang)
 
