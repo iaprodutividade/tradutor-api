@@ -12,6 +12,7 @@ import html
 import json
 import os
 from pathlib import Path
+from typing import Callable
 
 import fitz  # pymupdf
 from docx import Document
@@ -181,13 +182,18 @@ def process_pdf(
     source_lang: str,
     target_lang: str,
     page_indices: list[int] | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ):
     """page_indices=None processa o documento inteiro; uma lista processa só
-    essas páginas (0-based) — usado pela prévia grátis (só a 1ª página)."""
+    essas páginas (0-based) — usado pela prévia grátis (só a 1ª página).
+    on_progress(paginas_feitas, paginas_total), se passado, é chamado depois
+    de cada página terminar — usado pra barra de progresso do documento
+    completo pós-pagamento."""
     doc = fitz.open(input_path)
     pages = [doc[i] for i in page_indices] if page_indices is not None else doc
+    total_paginas_a_processar = len(pages)
 
-    for page in pages:
+    for indice_na_fila, page in enumerate(pages, start=1):
         # Guarda quanto conteudo visual (imagens/vetores) a pagina tinha antes
         # de mexer, pra comparar depois e pegar automaticamente qualquer bug
         # tipo "redacao apagou pedaco de imagem/borda por baixo" (ja aconteceu
@@ -263,6 +269,8 @@ def process_pdf(
             )
 
         if not block_infos:
+            if on_progress:
+                on_progress(indice_na_fila, total_paginas_a_processar)
             continue
 
         _avisar_colisao_com_conteudo_visual(page, block_infos, table_areas)
@@ -321,6 +329,9 @@ def process_pdf(
                 f"({num_desenhos_antes} -> {num_desenhos_depois})"
             )
 
+        if on_progress:
+            on_progress(indice_na_fila, total_paginas_a_processar)
+
     doc.save(output_path)
     doc.close()
 
@@ -342,7 +353,15 @@ def _iter_runs_text_units(doc: Document):
                         yield p
 
 
-def process_docx(input_path: Path, output_path: Path, source_lang: str, target_lang: str):
+def process_docx(
+    input_path: Path,
+    output_path: Path,
+    source_lang: str,
+    target_lang: str,
+    on_progress: Callable[[int, int], None] | None = None,
+):
+    """on_progress(paragrafos_feitos, paragrafos_total), se passado, é
+    chamado depois de cada lote traduzido — usado pra barra de progresso."""
     doc = Document(input_path)
     paragraphs = list(_iter_runs_text_units(doc))
     originals = [p.text for p in paragraphs]
@@ -352,6 +371,8 @@ def process_docx(input_path: Path, output_path: Path, source_lang: str, target_l
     translations: list[str] = []
     for i in range(0, len(originals), BATCH):
         translations.extend(translate_batch(originals[i : i + BATCH], source_lang, target_lang))
+        if on_progress:
+            on_progress(len(translations), len(originals))
 
     for p, translated in zip(paragraphs, translations):
         if not p.runs:

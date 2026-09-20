@@ -273,6 +273,17 @@ async def traduzir_completo(
 def _processar_job_completo(job: dict):
     job_id = job["id"]
     sufixo = Path(job["arquivo_original_path"]).suffix.lower()
+
+    # Atualiza o progresso no Supabase pra a tela de pagamento mostrar uma
+    # barra de verdade — unidades_total so e conhecido quando o processamento
+    # comeca (paginas do PDF, ou paragrafos reais do DOCX, diferente da
+    # estimativa grosseira usada so pra calcular o preco).
+    def progresso(feitas: int, total: int):
+        try:
+            _atualizar_job(job_id, {"unidades_processadas": feitas, "unidades_total": total})
+        except Exception:
+            pass  # nunca derruba o processamento por causa de um update de progresso
+
     try:
         conteudo = _baixar_do_storage(job["arquivo_original_path"])
 
@@ -282,9 +293,9 @@ def _processar_job_completo(job: dict):
             destino = Path(tmp) / f"traduzido{sufixo}"
 
             if sufixo == ".pdf":
-                process_pdf(origem, destino, job["idioma_origem"], job["idioma_destino"])
+                process_pdf(origem, destino, job["idioma_origem"], job["idioma_destino"], on_progress=progresso)
             else:
-                process_docx(origem, destino, job["idioma_origem"], job["idioma_destino"])
+                process_docx(origem, destino, job["idioma_origem"], job["idioma_destino"], on_progress=progresso)
 
             traduzido_bytes = destino.read_bytes()
 
