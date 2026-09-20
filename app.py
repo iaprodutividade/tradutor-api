@@ -63,17 +63,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Faixas de preco por pagina, aplicadas ao documento inteiro conforme o
-# total de paginas (sem degrau brusco tipo "49 paginas custa mais que 50" —
-# cada faixa cobre o documento todo, nao so as paginas acima do limite).
+# TESTE TEMPORARIO (Robson, 20/09) — precos baixados pra testar compra real
+# sem gastar muito. Valores originais pra reverter depois:
+# FAIXAS_PRECO = [(15, 500), (50, 450), (100, 400), (200, 350), (float("inf"), 300)]
+# PRECO_MINIMO_CENTAVOS = 1490
 FAIXAS_PRECO = [
-    (15, 500),  # ate 15 paginas: R$5,00/pagina
-    (50, 450),  # 16-50: R$4,50/pagina (10% off)
-    (100, 400),  # 51-100: R$4,00/pagina (20% off)
-    (200, 350),  # 101-200: R$3,50/pagina (30% off)
-    (float("inf"), 300),  # 200+: R$3,00/pagina (40% off)
+    (float("inf"), 100),  # TESTE: R$1,00/pagina, qualquer quantidade
 ]
-PRECO_MINIMO_CENTAVOS = 1490
+PRECO_MINIMO_CENTAVOS = 399  # TESTE: R$3,99
 
 
 def _checar_api_key(x_api_key: str | None):
