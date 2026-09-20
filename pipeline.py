@@ -119,10 +119,19 @@ def _merged_lines_runs(blocks: list[dict]) -> list[list[list]]:
     return lines_runs
 
 
-def process_pdf(input_path: Path, output_path: Path, source_lang: str, target_lang: str):
+def process_pdf(
+    input_path: Path,
+    output_path: Path,
+    source_lang: str,
+    target_lang: str,
+    page_indices: list[int] | None = None,
+):
+    """page_indices=None processa o documento inteiro; uma lista processa só
+    essas páginas (0-based) — usado pela prévia grátis (só a 1ª página)."""
     doc = fitz.open(input_path)
+    pages = [doc[i] for i in page_indices] if page_indices is not None else doc
 
-    for page in doc:
+    for page in pages:
         # Detecta tabelas de verdade (pelas linhas do desenho) pra nao deixar
         # o agrupamento generico de texto misturar conteudo de celulas vizinhas.
         table_cell_rects: list[fitz.Rect] = []
