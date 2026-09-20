@@ -136,7 +136,7 @@ async def preview(
 def _preview_pdf(origem: Path, tmp: Path, idioma_origem: str, idioma_destino: str):
     doc_original = fitz.open(origem)
     total_paginas = len(doc_original)
-    pix_original = doc_original[0].get_pixmap(dpi=120)
+    pix_original = doc_original[0].get_pixmap(dpi=200)
     imagem_original_b64 = base64.b64encode(pix_original.tobytes("png")).decode()
     doc_original.close()
 
@@ -144,7 +144,7 @@ def _preview_pdf(origem: Path, tmp: Path, idioma_origem: str, idioma_destino: st
     process_pdf(origem, traduzido, idioma_origem, idioma_destino, page_indices=[0])
 
     doc_traduzido = fitz.open(traduzido)
-    pix_traduzido = doc_traduzido[0].get_pixmap(dpi=120)
+    pix_traduzido = doc_traduzido[0].get_pixmap(dpi=200)
     imagem_traduzida_b64 = base64.b64encode(pix_traduzido.tobytes("png")).decode()
 
     # PDF de exemplo com só a 1ª página traduzida, pra baixar e conferir que o

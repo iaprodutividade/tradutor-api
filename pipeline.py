@@ -102,6 +102,13 @@ def _block_lines_runs(block: dict) -> list[list[list]]:
     return lines_runs
 
 
+def _has_visible_text(lines_runs: list[list[list]]) -> bool:
+    """Bloco cujos runs sao so espacos em branco nao tem nada visivel pra
+    traduzir/redatar — incluir esse bloco so arrisca redatar (pintar de
+    branco) por cima de imagem/vetor vizinho que a bbox encoste."""
+    return any(text.strip() for line_runs in lines_runs for text, _bold in line_runs)
+
+
 def _rect_center_inside(bbox, rect: fitz.Rect) -> bool:
     cx = (bbox[0] + bbox[2]) / 2
     cy = (bbox[1] + bbox[3]) / 2
@@ -155,7 +162,7 @@ def process_pdf(
             size = cell_blocks[0]["lines"][0]["spans"][0]["size"]
             color = cell_blocks[0]["lines"][0]["spans"][0]["color"]
             lines_runs = _merged_lines_runs(cell_blocks)
-            if not lines_runs:
+            if not lines_runs or not _has_visible_text(lines_runs):
                 continue
             run_indices = []
             for line_runs in lines_runs:
@@ -179,7 +186,7 @@ def process_pdf(
             if any(_rect_center_inside(b["bbox"], area) for area in table_areas):
                 continue
             lines_runs = _block_lines_runs(b)
-            if not lines_runs:
+            if not lines_runs or not _has_visible_text(lines_runs):
                 continue
             first_span = b["lines"][0]["spans"][0]
             run_indices = []
