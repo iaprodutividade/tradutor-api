@@ -58,7 +58,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-PRECO_POR_PAGINA_CENTAVOS = 500
+# Faixas de preco por pagina, aplicadas ao documento inteiro conforme o
+# total de paginas (sem degrau brusco tipo "49 paginas custa mais que 50" —
+# cada faixa cobre o documento todo, nao so as paginas acima do limite).
+FAIXAS_PRECO = [
+    (15, 500),  # ate 15 paginas: R$5,00/pagina
+    (50, 450),  # 16-50: R$4,50/pagina (10% off)
+    (100, 400),  # 51-100: R$4,00/pagina (20% off)
+    (200, 350),  # 101-200: R$3,50/pagina (30% off)
+    (float("inf"), 300),  # 200+: R$3,00/pagina (40% off)
+]
 PRECO_MINIMO_CENTAVOS = 1490
 
 
@@ -67,8 +76,16 @@ def _checar_api_key(x_api_key: str | None):
         raise HTTPException(status_code=401, detail="chave de API invalida")
 
 
+def _preco_por_pagina_centavos(paginas: int) -> int:
+    for limite, preco in FAIXAS_PRECO:
+        if paginas <= limite:
+            return preco
+    return FAIXAS_PRECO[-1][1]
+
+
 def _calcular_preco(paginas: int) -> int:
-    return max(PRECO_MINIMO_CENTAVOS, paginas * PRECO_POR_PAGINA_CENTAVOS)
+    preco_pagina = _preco_por_pagina_centavos(paginas)
+    return max(PRECO_MINIMO_CENTAVOS, paginas * preco_pagina)
 
 
 @app.get("/healthz")
@@ -130,6 +147,7 @@ def _preview_pdf(origem: Path, tmp: Path, idioma_origem: str, idioma_destino: st
         "tipo": "pdf",
         "paginas_total": total_paginas,
         "preco_centavos": _calcular_preco(total_paginas),
+        "preco_por_pagina_centavos": _preco_por_pagina_centavos(total_paginas),
         "imagem_original_base64": imagem_original_b64,
         "imagem_traduzida_base64": imagem_traduzida_b64,
     }
@@ -154,6 +172,7 @@ def _preview_docx(origem: Path, tmp: Path, idioma_origem: str, idioma_destino: s
         "tipo": "docx",
         "paginas_total": paginas_estimadas,
         "preco_centavos": _calcular_preco(paginas_estimadas),
+        "preco_por_pagina_centavos": _preco_por_pagina_centavos(paginas_estimadas),
         "texto_original": originais,
         "texto_traduzido": traduzidos,
         "paragrafos_restantes": max(0, total_paragrafos - len(amostra)),
