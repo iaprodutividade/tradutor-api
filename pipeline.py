@@ -139,6 +139,13 @@ def process_pdf(
     pages = [doc[i] for i in page_indices] if page_indices is not None else doc
 
     for page in pages:
+        # Guarda quanto conteudo visual (imagens/vetores) a pagina tinha antes
+        # de mexer, pra comparar depois e pegar automaticamente qualquer bug
+        # tipo "redacao apagou pedaco de imagem/borda por baixo" (ja aconteceu
+        # com uma logo e com bordas de tabela).
+        num_imagens_antes = len(page.get_image_info())
+        num_desenhos_antes = len(page.get_drawings())
+
         # Detecta tabelas de verdade (pelas linhas do desenho) pra nao deixar
         # o agrupamento generico de texto misturar conteudo de celulas vizinhas.
         table_cell_rects: list[fitz.Rect] = []
@@ -239,6 +246,27 @@ def process_pdf(
                 f"font-size: {info['size']}pt; color: {color_hex}; }}"
             )
             page.insert_htmlbox(rect, html_content, css=css, scale_low=0)
+
+        # As bordas da tabela costumam ser desenhadas como retangulos finos
+        # bem em cima do limite de cada celula — a redacao de texto por cima
+        # apaga esses pixels junto. Redesenha a grade depois de inserir o
+        # texto pra tabela ficar identica a original.
+        for cell_rect in table_cell_rects:
+            page.draw_rect(cell_rect, color=(0, 0, 0), width=0.75)
+
+        # Confere se sobrou tudo que a pagina original tinha de visual.
+        num_imagens_depois = len(page.get_image_info())
+        num_desenhos_depois = len(page.get_drawings())
+        if num_imagens_depois < num_imagens_antes:
+            print(
+                f"[ALERTA] pagina {page.number}: perdeu imagem no processamento "
+                f"({num_imagens_antes} -> {num_imagens_depois})"
+            )
+        if num_desenhos_depois < num_desenhos_antes * 0.8:
+            print(
+                f"[ALERTA] pagina {page.number}: perdeu boa parte dos desenhos/bordas "
+                f"({num_desenhos_antes} -> {num_desenhos_depois})"
+            )
 
     doc.save(output_path)
     doc.close()
