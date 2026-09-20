@@ -7,12 +7,14 @@ Mercado Pago.
 import base64
 import os
 import tempfile
+import time
+from collections import defaultdict, deque
 from pathlib import Path
 
 import fitz  # pymupdf
 from docx import Document
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Header
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, Header
 from fastapi.middleware.cors import CORSMiddleware
 
 from pipeline import process_pdf, translate_batch
@@ -22,6 +24,24 @@ load_dotenv(Path(__file__).parent / ".env")
 API_KEY = os.environ.get("TRADUTOR_API_KEY")
 
 app = FastAPI(title="Tradutor API")
+
+MAX_TAMANHO_ARQUIVO = 15 * 1024 * 1024  # 15 MB — prévia só usa a 1ª pagina/paragrafos
+
+# Limite de requisicoes por IP no endpoint publico de previa (evita bot
+# martelar o endpoint e gerar custo de OpenAI sem controle). Em memoria —
+# reseta se o container reiniciar, suficiente pra uma instancia so.
+LIMITE_REQUISICOES_POR_HORA = 15
+_requisicoes_por_ip: dict[str, deque] = defaultdict(deque)
+
+
+def _checar_rate_limit(ip: str):
+    agora = time.time()
+    fila = _requisicoes_por_ip[ip]
+    while fila and agora - fila[0] > 3600:
+        fila.popleft()
+    if len(fila) >= LIMITE_REQUISICOES_POR_HORA:
+        raise HTTPException(status_code=429, detail="Muitas tentativas. Tenta de novo mais tarde.")
+    fila.append(agora)
 
 ALLOWED_ORIGINS = [
     o.strip()
@@ -56,20 +76,31 @@ def healthz():
     return {"status": "ok"}
 
 
+def _ip_do_cliente(request: Request) -> str:
+    encaminhado = request.headers.get("x-forwarded-for")
+    if encaminhado:
+        return encaminhado.split(",")[0].strip()
+    return request.client.host if request.client else "desconhecido"
+
+
 @app.post("/preview")
 async def preview(
+    request: Request,
     arquivo: UploadFile = File(...),
     idioma_origem: str = Form(...),
     idioma_destino: str = Form(...),
     x_api_key: str | None = Header(default=None),
 ):
     _checar_api_key(x_api_key)
+    _checar_rate_limit(_ip_do_cliente(request))
 
     sufixo = Path(arquivo.filename or "").suffix.lower()
     if sufixo not in (".pdf", ".docx"):
         raise HTTPException(status_code=400, detail="Só aceitamos .pdf ou .docx")
 
     conteudo = await arquivo.read()
+    if len(conteudo) > MAX_TAMANHO_ARQUIVO:
+        raise HTTPException(status_code=413, detail="Arquivo muito grande (limite de 15 MB).")
 
     with tempfile.TemporaryDirectory() as tmp:
         origem = Path(tmp) / f"origem{sufixo}"
