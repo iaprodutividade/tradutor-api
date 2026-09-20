@@ -12,16 +12,21 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 import fitz  # pymupdf
+import httpx
 from docx import Document
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, Header
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile, Header
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-from pipeline import process_pdf, translate_batch
+from pipeline import process_docx, process_pdf, translate_batch
 
 load_dotenv(Path(__file__).parent / ".env")
 
 API_KEY = os.environ.get("TRADUTOR_API_KEY")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY")
+BUCKET_ARQUIVOS = "tradutor-arquivos"
 
 app = FastAPI(title="Tradutor API")
 
@@ -141,6 +146,13 @@ def _preview_pdf(origem: Path, tmp: Path, idioma_origem: str, idioma_destino: st
     doc_traduzido = fitz.open(traduzido)
     pix_traduzido = doc_traduzido[0].get_pixmap(dpi=120)
     imagem_traduzida_b64 = base64.b64encode(pix_traduzido.tobytes("png")).decode()
+
+    # PDF de exemplo com só a 1ª página traduzida, pra baixar e conferir que o
+    # texto é de verdade (selecionável/editável), não uma imagem achatada.
+    pagina_unica = fitz.open()
+    pagina_unica.insert_pdf(doc_traduzido, from_page=0, to_page=0)
+    pdf_traduzido_b64 = base64.b64encode(pagina_unica.tobytes()).decode()
+    pagina_unica.close()
     doc_traduzido.close()
 
     return {
@@ -150,6 +162,7 @@ def _preview_pdf(origem: Path, tmp: Path, idioma_origem: str, idioma_destino: st
         "preco_por_pagina_centavos": _preco_por_pagina_centavos(total_paginas),
         "imagem_original_base64": imagem_original_b64,
         "imagem_traduzida_base64": imagem_traduzida_b64,
+        "pdf_traduzido_base64": pdf_traduzido_b64,
     }
 
 
@@ -177,3 +190,114 @@ def _preview_docx(origem: Path, tmp: Path, idioma_origem: str, idioma_destino: s
         "texto_traduzido": traduzidos,
         "paragrafos_restantes": max(0, total_paragrafos - len(amostra)),
     }
+
+
+# ---------------------------------------------------------------------------
+# Processamento completo (pos-pagamento) — chamado pelo webhook do Mercado
+# Pago em tradutor-web. Le/grava direto no Supabase (Storage + tabela jobs)
+# via REST, sem SDK, pra nao depender de versao de biblioteca. Roda em
+# BackgroundTasks porque um documento grande pode levar minutos — bem alem do
+# tempo que uma funcao serverless do Next.js/Vercel aguentaria esperar.
+# ---------------------------------------------------------------------------
+
+
+def _supabase_headers(content_type: str | None = None) -> dict:
+    headers = {"apikey": SUPABASE_SECRET_KEY, "Authorization": f"Bearer {SUPABASE_SECRET_KEY}"}
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
+
+
+def _buscar_job(job_id: str) -> dict | None:
+    resp = httpx.get(
+        f"{SUPABASE_URL}/rest/v1/jobs",
+        params={"id": f"eq.{job_id}", "select": "*"},
+        headers=_supabase_headers(),
+        timeout=30,
+    )
+    resp.raise_for_status()
+    linhas = resp.json()
+    return linhas[0] if linhas else None
+
+
+def _atualizar_job(job_id: str, campos: dict):
+    resp = httpx.patch(
+        f"{SUPABASE_URL}/rest/v1/jobs",
+        params={"id": f"eq.{job_id}"},
+        headers={**_supabase_headers("application/json"), "Prefer": "return=minimal"},
+        json=campos,
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+
+def _baixar_do_storage(path: str) -> bytes:
+    resp = httpx.get(f"{SUPABASE_URL}/storage/v1/object/{BUCKET_ARQUIVOS}/{path}", headers=_supabase_headers(), timeout=120)
+    resp.raise_for_status()
+    return resp.content
+
+
+def _subir_para_storage(path: str, conteudo: bytes, content_type: str):
+    resp = httpx.post(
+        f"{SUPABASE_URL}/storage/v1/object/{BUCKET_ARQUIVOS}/{path}",
+        headers=_supabase_headers(content_type),
+        content=conteudo,
+        timeout=120,
+    )
+    resp.raise_for_status()
+
+
+class TraduzirCompletoBody(BaseModel):
+    job_id: str
+
+
+@app.post("/traduzir-completo", status_code=202)
+async def traduzir_completo(
+    body: TraduzirCompletoBody,
+    background_tasks: BackgroundTasks,
+    x_api_key: str | None = Header(default=None),
+):
+    _checar_api_key(x_api_key)
+    if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Supabase não configurado no backend (SUPABASE_URL/SUPABASE_SECRET_KEY).")
+
+    job = _buscar_job(body.job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job não encontrado")
+    if job["status"] != "pago":
+        # Idempotente: o webhook pode reenviar a mesma notificação de pagamento.
+        return {"ok": True, "ignorado": f"status atual é {job['status']}"}
+
+    _atualizar_job(body.job_id, {"status": "processando"})
+    background_tasks.add_task(_processar_job_completo, job)
+    return {"ok": True}
+
+
+def _processar_job_completo(job: dict):
+    job_id = job["id"]
+    sufixo = Path(job["arquivo_original_path"]).suffix.lower()
+    try:
+        conteudo = _baixar_do_storage(job["arquivo_original_path"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            origem = Path(tmp) / f"origem{sufixo}"
+            origem.write_bytes(conteudo)
+            destino = Path(tmp) / f"traduzido{sufixo}"
+
+            if sufixo == ".pdf":
+                process_pdf(origem, destino, job["idioma_origem"], job["idioma_destino"])
+            else:
+                process_docx(origem, destino, job["idioma_origem"], job["idioma_destino"])
+
+            traduzido_bytes = destino.read_bytes()
+
+        caminho_traduzido = f"traduzidos/{job_id}{sufixo}"
+        content_type = (
+            "application/pdf"
+            if sufixo == ".pdf"
+            else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+        _subir_para_storage(caminho_traduzido, traduzido_bytes, content_type)
+        _atualizar_job(job_id, {"status": "pronto", "arquivo_traduzido_path": caminho_traduzido})
+    except Exception as exc:
+        _atualizar_job(job_id, {"status": "erro", "erro_mensagem": str(exc)[:2000]})
