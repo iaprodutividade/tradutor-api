@@ -201,6 +201,19 @@ def process_pdf(
         num_imagens_antes = len(page.get_image_info())
         num_desenhos_antes = len(page.get_drawings())
 
+        # Linhas divisorias finas (separador de secao, sublinhado de titulo
+        # etc.) tem bbox com altura/largura quase zero — a checagem de
+        # colisao com conteudo visual (mais abaixo) ignora elas de proposito
+        # (ruido demais senao), o que significa que uma redacao por cima
+        # apaga a linha sem ninguem perceber. Guarda todas agora pra
+        # redesenhar depois de inserir o texto, do mesmo jeito que a borda
+        # de tabela.
+        linhas_finas = [
+            d
+            for d in page.get_drawings()
+            if d.get("type") == "s" and (fitz.Rect(d["rect"]).width < 1 or fitz.Rect(d["rect"]).height < 1)
+        ]
+
         # Detecta tabelas de verdade (pelas linhas do desenho) pra nao deixar
         # o agrupamento generico de texto misturar conteudo de celulas vizinhas.
         table_cell_rects: list[fitz.Rect] = []
@@ -314,6 +327,17 @@ def process_pdf(
         # texto pra tabela ficar identica a original.
         for cell_rect in table_cell_rects:
             page.draw_rect(cell_rect, color=(0, 0, 0), width=0.75)
+
+        # Redesenha as linhas divisorias finas capturadas no inicio, com a
+        # mesma cor/espessura originais.
+        for linha in linhas_finas:
+            r = fitz.Rect(linha["rect"])
+            page.draw_line(
+                (r.x0, r.y0),
+                (r.x1, r.y1),
+                color=linha.get("color") or (0, 0, 0),
+                width=linha.get("width") or 0.5,
+            )
 
         # Confere se sobrou tudo que a pagina original tinha de visual.
         num_imagens_depois = len(page.get_image_info())
