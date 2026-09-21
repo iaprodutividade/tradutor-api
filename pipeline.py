@@ -136,6 +136,36 @@ def _block_lines_runs(block: dict) -> list[list[list]]:
 
 _MARCADORES_SOLTOS = {"•", "·", "●", "○", "▪", "‣", "◦", "-", "*"}
 
+# Area minima (pt^2) pra um retangulo preenchido contar como "fundo
+# colorido de verdade" (banner de secao, destaque) — evita que um icone ou
+# elemento pequeno qualquer seja confundido com fundo de texto.
+AREA_MINIMA_FUNDO_COLORIDO = 500
+
+
+def _mapear_fundos_coloridos(page: fitz.Page) -> list[tuple[fitz.Rect, tuple]]:
+    """Lista os retangulos preenchidos grandes da pagina (banners de secao,
+    faixas de destaque etc.) — usado pra saber, antes de redatar um bloco de
+    texto, se ele esta em cima de uma cor de fundo diferente de branco."""
+    return [
+        (fitz.Rect(d["rect"]), d["fill"])
+        for d in page.get_drawings()
+        if d.get("type") == "f" and d.get("fill") and fitz.Rect(d["rect"]).get_area() > AREA_MINIMA_FUNDO_COLORIDO
+    ]
+
+
+def _cor_fundo_do_bloco(bbox: fitz.Rect, fundos: list[tuple[fitz.Rect, tuple]]) -> tuple:
+    """Acha o retangulo de fundo colorido mais especifico (menor area) que
+    cobre o centro do bloco, pra redatar com essa cor em vez de branco fixo
+    — senao a redacao apaga um banner colorido (ex.: cabecalho de secao com
+    fundo azul e texto branco) e deixa um buraco branco, ou pior, texto
+    branco reinserido sobre fundo branco (invisivel)."""
+    centro = fitz.Point((bbox.x0 + bbox.x1) / 2, (bbox.y0 + bbox.y1) / 2)
+    melhor: tuple[fitz.Rect, tuple] | None = None
+    for rect, cor in fundos:
+        if rect.contains(centro) and (melhor is None or rect.get_area() < melhor[0].get_area()):
+            melhor = (rect, cor)
+    return melhor[1] if melhor else (1, 1, 1)
+
 
 def _has_visible_text(lines_runs: list[list[list]]) -> bool:
     """Bloco cujos runs sao so espacos em branco nao tem nada visivel pra
@@ -249,6 +279,13 @@ def process_pdf(
             if d.get("type") in ("s", "f") and (fitz.Rect(d["rect"]).width < 1 or fitz.Rect(d["rect"]).height < 1)
         ]
 
+        # Banners/faixas de destaque (fundo colorido, tipo cabecalho de
+        # secao) — pra redatar o texto que fica em cima delas com a mesma
+        # cor do fundo, nao com branco fixo (senao apaga o banner colorido
+        # e, se o texto original era branco, o texto novo fica invisivel
+        # em cima do branco que sobrou).
+        fundos_coloridos = _mapear_fundos_coloridos(page)
+
         # Detecta tabelas de verdade (pelas linhas do desenho) pra nao deixar
         # o agrupamento generico de texto misturar conteudo de celulas vizinhas.
         table_cell_rects: list[fitz.Rect] = []
@@ -330,7 +367,9 @@ def process_pdf(
         # apague pedaco do texto ja inserido de outro bloco, quando as caixas
         # originais se encostam/leve sobreposicao de bbox).
         for info in block_infos:
-            page.add_redact_annot(fitz.Rect(info["bbox"]), fill=(1, 1, 1))
+            bbox = fitz.Rect(info["bbox"])
+            cor_fundo = _cor_fundo_do_bloco(bbox, fundos_coloridos)
+            page.add_redact_annot(bbox, fill=cor_fundo)
         page.apply_redactions()
 
         # Fase 2: insere o texto traduzido de cada bloco.
