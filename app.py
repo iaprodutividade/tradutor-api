@@ -19,7 +19,13 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from pipeline import process_docx, process_pdf, translate_batch
+from pipeline import (
+    _aplicar_traducao_em_paragrafos,
+    gerar_imagem_previa_docx,
+    process_docx,
+    process_pdf,
+    translate_batch,
+)
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -181,6 +187,15 @@ def _preview_docx(origem: Path, tmp: Path, idioma_origem: str, idioma_destino: s
     # nesse formato) — usada so pra calcular o preco.
     paginas_estimadas = max(1, round(total_paragrafos / 25))
 
+    # Imagem da 1a pagina de verdade (via LibreOffice), pra mostrar que o
+    # layout do Word e mantido — so os mesmos paragrafos ja traduzidos
+    # acima, sem gastar mais tradução do que a previa em texto já gasta.
+    imagem_original_b64 = gerar_imagem_previa_docx(Document(origem))
+    doc_traduzido = Document(origem)
+    paragrafos_traduzido = [p for p in doc_traduzido.paragraphs if p.text.strip()]
+    _aplicar_traducao_em_paragrafos(paragrafos_traduzido[:LIMITE_PARAGRAFOS_PREVIA], traduzidos)
+    imagem_traduzida_b64 = gerar_imagem_previa_docx(doc_traduzido)
+
     return {
         "tipo": "docx",
         "paginas_total": paginas_estimadas,
@@ -188,6 +203,8 @@ def _preview_docx(origem: Path, tmp: Path, idioma_origem: str, idioma_destino: s
         "preco_por_pagina_centavos": _preco_por_pagina_centavos(paginas_estimadas),
         "texto_original": originais,
         "texto_traduzido": traduzidos,
+        "imagem_original_base64": imagem_original_b64,
+        "imagem_traduzida_base64": imagem_traduzida_b64,
         "paragrafos_restantes": max(0, total_paragrafos - len(amostra)),
     }
 

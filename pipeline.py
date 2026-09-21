@@ -8,9 +8,12 @@ na mesma caixa com auto-ajuste de tamanho de fonte.
 Tambem trata .docx (python-docx), traduzindo paragrafos e celulas de tabela
 mantendo a formatacao nativa do Word.
 """
+import base64
 import html
 import json
 import os
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Callable
 
@@ -84,11 +87,39 @@ def _is_bold(span: dict) -> bool:
     return "bold" in span["font"].lower() or bool(span.get("flags", 0) & 16)
 
 
+def _mesclar_linhas_mesma_altura(raw_lines: list[dict]) -> list[dict]:
+    """Texto justificado com espacamento largo entre palavras as vezes faz o
+    PyMuPDF fragmentar uma unica linha visual em varias entradas de 'line'
+    (uma por palavra/grupo), todas na mesma faixa vertical. Sem isso, cada
+    palavra vira uma linha de HTML separada (<br> entre cada uma) — quebra o
+    paragrafo inteiro. Funde entradas com bbox verticalmente sobreposta,
+    preservando a ordem (ja vem da esquerda pra direita)."""
+    mescladas: list[dict] = []
+    for line in raw_lines:
+        y0, y1 = line["bbox"][1], line["bbox"][3]
+        if mescladas:
+            atual = mescladas[-1]
+            ay0, ay1 = atual["bbox"][1], atual["bbox"][3]
+            sobreposicao = min(y1, ay1) - max(y0, ay0)
+            altura_min = min(y1 - y0, ay1 - ay0)
+            if altura_min > 0 and sobreposicao / altura_min > 0.5:
+                atual["spans"] = atual["spans"] + line["spans"]
+                atual["bbox"] = (
+                    min(atual["bbox"][0], line["bbox"][0]),
+                    min(ay0, y0),
+                    max(atual["bbox"][2], line["bbox"][2]),
+                    max(ay1, y1),
+                )
+                continue
+        mescladas.append({"spans": list(line["spans"]), "bbox": line["bbox"]})
+    return mescladas
+
+
 def _block_lines_runs(block: dict) -> list[list[list]]:
     """Por linha, agrupa spans consecutivos com o mesmo estilo (negrito) num run.
     Devolve lista de linhas, cada linha = lista de [texto, negrito]."""
     lines_runs = []
-    for line in block["lines"]:
+    for line in _mesclar_linhas_mesma_altura(block["lines"]):
         runs: list[list] = []
         for span in line["spans"]:
             if not span["text"]:
@@ -101,6 +132,9 @@ def _block_lines_runs(block: dict) -> list[list[list]]:
         if runs:
             lines_runs.append(runs)
     return lines_runs
+
+
+_MARCADORES_SOLTOS = {"•", "·", "●", "○", "▪", "‣", "◦", "-", "*"}
 
 
 def _has_visible_text(lines_runs: list[list[list]]) -> bool:
@@ -306,14 +340,32 @@ def process_pdf(
             color_hex = "#{:06x}".format(color if color else 0)
 
             idx_iter = iter(info["run_indices"])
-            html_lines = []
+            html_lines: list[str] = []
+            prefixo_pendente = ""
             for line_runs in info["lines_runs"]:
                 parts = []
                 for text, bold in line_runs:
                     i = next(idx_iter)
                     translated = html.escape(flat_translations[i])
                     parts.append(f"<b>{translated}</b>" if bold else translated)
-                html_lines.append("".join(parts))
+                linha_html = "".join(parts)
+
+                # Marcador de lista (•, -, etc.) as vezes vem como uma "linha"
+                # propria na extracao do PDF, separada do texto que ele
+                # introduz, mesmo os dois ficando juntos no visual original.
+                # Forcar quebra de linha aqui dobraria a altura necessaria e
+                # o insert_htmlbox encolheria a fonte pra caber na bbox
+                # (bem apertada) — em vez disso, funde o marcador com a
+                # proxima linha.
+                texto_puro = "".join(t for t, _ in line_runs).strip()
+                if len(line_runs) == 1 and texto_puro in _MARCADORES_SOLTOS:
+                    prefixo_pendente = linha_html + " "
+                    continue
+
+                html_lines.append(prefixo_pendente + linha_html)
+                prefixo_pendente = ""
+            if prefixo_pendente:
+                html_lines.append(prefixo_pendente)
             html_content = "<br>".join(html_lines)
 
             css = (
@@ -403,16 +455,43 @@ def process_docx(
         if on_progress:
             on_progress(len(translations), len(originals))
 
+    _aplicar_traducao_em_paragrafos(paragraphs, translations)
+    doc.save(output_path)
+
+
+def _aplicar_traducao_em_paragrafos(paragraphs: list, translations: list[str]) -> None:
+    """Concentra o texto traduzido no primeiro run de cada paragrafo
+    (preserva a formatacao dele) e limpa os runs seguintes, pra nao
+    duplicar formatacao/texto antigo."""
     for p, translated in zip(paragraphs, translations):
         if not p.runs:
             continue
-        # concentra o texto traduzido no primeiro run (preserva a formatacao dele)
-        # e limpa os runs seguintes, pra nao duplicar formatacao/texto antigo.
         p.runs[0].text = translated
         for r in p.runs[1:]:
             r.text = ""
 
-    doc.save(output_path)
+
+def gerar_imagem_previa_docx(doc: Document, dpi: int = 150) -> str:
+    """Salva o Document num arquivo temporario, converte pra PDF via
+    LibreOffice headless (precisa do pacote libreoffice-writer instalado) e
+    devolve a 1a pagina como PNG em base64 — usado pra previa visual do
+    DOCX (mostrar que o layout foi mantido de verdade, nao so o texto
+    solto sem formatacao)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        docx_path = tmp_path / "previa.docx"
+        doc.save(docx_path)
+        subprocess.run(
+            ["soffice", "--headless", "--convert-to", "pdf", "--outdir", str(tmp_path), str(docx_path)],
+            check=True,
+            timeout=60,
+            capture_output=True,
+        )
+        pdf_doc = fitz.open(tmp_path / "previa.pdf")
+        pix = pdf_doc[0].get_pixmap(dpi=dpi)
+        png_bytes = pix.tobytes("png")
+        pdf_doc.close()
+        return base64.b64encode(png_bytes).decode()
 
 
 # ---------------------------------------------------------------------------
