@@ -205,13 +205,14 @@ def process_pdf(
         # etc.) tem bbox com altura/largura quase zero — a checagem de
         # colisao com conteudo visual (mais abaixo) ignora elas de proposito
         # (ruido demais senao), o que significa que uma redacao por cima
-        # apaga a linha sem ninguem perceber. Guarda todas agora pra
-        # redesenhar depois de inserir o texto, do mesmo jeito que a borda
-        # de tabela.
+        # apaga a linha sem ninguem perceber. Podem ser desenhadas tanto como
+        # traco ("s") quanto como retangulo fino preenchido ("f") — guarda os
+        # dois tipos agora pra redesenhar depois de inserir o texto, do mesmo
+        # jeito que a borda de tabela.
         linhas_finas = [
             d
             for d in page.get_drawings()
-            if d.get("type") == "s" and (fitz.Rect(d["rect"]).width < 1 or fitz.Rect(d["rect"]).height < 1)
+            if d.get("type") in ("s", "f") and (fitz.Rect(d["rect"]).width < 1 or fitz.Rect(d["rect"]).height < 1)
         ]
 
         # Detecta tabelas de verdade (pelas linhas do desenho) pra nao deixar
@@ -332,12 +333,16 @@ def process_pdf(
         # mesma cor/espessura originais.
         for linha in linhas_finas:
             r = fitz.Rect(linha["rect"])
-            page.draw_line(
-                (r.x0, r.y0),
-                (r.x1, r.y1),
-                color=linha.get("color") or (0, 0, 0),
-                width=linha.get("width") or 0.5,
-            )
+            cor = linha.get("color") or linha.get("fill") or (0, 0, 0)
+            if r.height <= r.width:
+                y_meio = (r.y0 + r.y1) / 2
+                p1, p2 = (r.x0, y_meio), (r.x1, y_meio)
+                espessura = linha.get("width") or r.height or 0.5
+            else:
+                x_meio = (r.x0 + r.x1) / 2
+                p1, p2 = (x_meio, r.y0), (x_meio, r.y1)
+                espessura = linha.get("width") or r.width or 0.5
+            page.draw_line(p1, p2, color=cor, width=max(espessura, 0.3))
 
         # Confere se sobrou tudo que a pagina original tinha de visual.
         num_imagens_depois = len(page.get_image_info())
