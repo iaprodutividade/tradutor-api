@@ -68,9 +68,9 @@ app.add_middleware(
 # FAIXAS_PRECO = [(15, 500), (50, 450), (100, 400), (200, 350), (float("inf"), 300)]
 # PRECO_MINIMO_CENTAVOS = 1490
 FAIXAS_PRECO = [
-    (float("inf"), 100),  # TESTE: R$1,00/pagina, qualquer quantidade
+    (float("inf"), 50),  # TESTE: R$0,50/pagina, qualquer quantidade
 ]
-PRECO_MINIMO_CENTAVOS = 399  # TESTE: R$3,99
+PRECO_MINIMO_CENTAVOS = 100  # TESTE: R$1,00 (nao baixar mais — perto do minimo aceito pelo Mercado Pago)
 
 
 def _checar_api_key(x_api_key: str | None):
