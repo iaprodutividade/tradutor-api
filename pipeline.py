@@ -481,11 +481,26 @@ def gerar_imagem_previa_docx(doc: Document, dpi: int = 150) -> str:
         tmp_path = Path(tmp)
         docx_path = tmp_path / "previa.docx"
         doc.save(docx_path)
+        # O usuario do container nao tem HOME de verdade (nao roda como root),
+        # entao o LibreOffice falha ao criar seu perfil padrao ("User
+        # installation could not be completed", exit 77) sem apontar um
+        # diretorio gravavel explicito via UserInstallation.
+        perfil_lo = f"file://{tmp_path}/lo_profile"
         subprocess.run(
-            ["soffice", "--headless", "--convert-to", "pdf", "--outdir", str(tmp_path), str(docx_path)],
+            [
+                "soffice",
+                "--headless",
+                f"-env:UserInstallation={perfil_lo}",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                str(tmp_path),
+                str(docx_path),
+            ],
             check=True,
             timeout=60,
             capture_output=True,
+            env={**os.environ, "HOME": str(tmp_path)},
         )
         pdf_doc = fitz.open(tmp_path / "previa.pdf")
         pix = pdf_doc[0].get_pixmap(dpi=dpi)
