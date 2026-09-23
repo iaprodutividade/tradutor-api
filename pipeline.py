@@ -115,9 +115,12 @@ def _mesclar_linhas_mesma_altura(raw_lines: list[dict]) -> list[dict]:
     return mescladas
 
 
-def _block_lines_runs(block: dict) -> list[list[list]]:
+def _block_lines_runs(block: dict) -> list[tuple[list[list], tuple]]:
     """Por linha, agrupa spans consecutivos com o mesmo estilo (negrito) num run.
-    Devolve lista de linhas, cada linha = lista de [texto, negrito]."""
+    Devolve lista de (runs, bbox) por linha — runs e a lista de [texto, negrito],
+    bbox e usado depois pra decidir se a quebra pra proxima linha era so
+    word-wrap do original (junta com espaco ao traduzir) ou uma quebra de
+    verdade (mantem <br>)."""
     lines_runs = []
     for line in _mesclar_linhas_mesma_altura(block["lines"]):
         runs: list[list] = []
@@ -130,8 +133,39 @@ def _block_lines_runs(block: dict) -> list[list[list]]:
             else:
                 runs.append([span["text"], bold])
         if runs:
-            lines_runs.append(runs)
+            lines_runs.append((runs, line["bbox"]))
     return lines_runs
+
+
+def _dividir_em_subblocos(
+    lines_runs: list[tuple[list[list], tuple]]
+) -> list[list[tuple[list[list], tuple]]]:
+    """Divide as linhas de um bloco em sub-grupos quando tudo indica que o
+    bloco mistura conteudo de duas fileiras/paragrafos diferentes: a linha
+    anterior termina em pontuacao final E a linha atual volta bem perto da
+    margem esquerda do bloco (nao e uma continuacao com recuo, e sim o
+    inicio de um texto novo). Isso acontece em documentos com layout de 2
+    colunas sem tabela de verdade (tipo FISPQ/FDS) — o PyMuPDF as vezes
+    agrupa o final da frase de uma fileira com o rotulo da fileira seguinte
+    num unico bloco, so por estarem geometricamente proximos, sem nenhum
+    espaco vertical extra que desse pra detectar isso so pela distancia
+    entre linhas. Sem separar, a bbox do bloco fica alta/larga demais e
+    mistura o texto errado, causando sobreposicao quando o idioma de
+    destino tem tamanho bem diferente do original."""
+    if not lines_runs:
+        return []
+    margem_esquerda = min(bbox[0] for _runs, bbox in lines_runs)
+    grupos: list[list[tuple[list[list], tuple]]] = [[lines_runs[0]]]
+    for i in range(1, len(lines_runs)):
+        runs_anterior, _bbox_anterior = lines_runs[i - 1]
+        _runs_atual, bbox_atual = lines_runs[i]
+        texto_anterior = "".join(t for t, _ in runs_anterior).strip()
+        termina_frase = texto_anterior.rstrip().endswith((".", ":", ";", "!", "?"))
+        volta_pra_margem = abs(bbox_atual[0] - margem_esquerda) < 2.0
+        if termina_frase and volta_pra_margem:
+            grupos.append([])
+        grupos[-1].append(lines_runs[i])
+    return grupos
 
 
 _MARCADORES_SOLTOS = {"•", "·", "●", "○", "▪", "‣", "◦", "-", "*"}
@@ -167,11 +201,36 @@ def _cor_fundo_do_bloco(bbox: fitz.Rect, fundos: list[tuple[fitz.Rect, tuple]]) 
     return melhor[1] if melhor else (1, 1, 1)
 
 
-def _has_visible_text(lines_runs: list[list[list]]) -> bool:
+def _has_visible_text(lines_runs: list[tuple[list[list], tuple]]) -> bool:
     """Bloco cujos runs sao so espacos em branco nao tem nada visivel pra
     traduzir/redatar — incluir esse bloco so arrisca redatar (pintar de
     branco) por cima de imagem/vetor vizinho que a bbox encoste."""
-    return any(text.strip() for line_runs in lines_runs for text, _bold in line_runs)
+    return any(text.strip() for line_runs, _bbox in lines_runs for text, _bold in line_runs)
+
+
+def _largura_segura_x1(bloco_info: dict, outros_blocos_normais: list[dict]) -> float:
+    """Acha o x1 seguro pra inserir o texto traduzido de um bloco sem invadir
+    a coluna de outro bloco posicionado a direita na mesma faixa vertical.
+    Em layouts de 2 colunas sem tabela de verdade (rotulo : valor lado a
+    lado, comum em FISPQ/FDS), as bboxes originais as vezes ja se sobrepoem
+    horizontalmente — isso e seguro no idioma de origem porque aquele texto
+    especifico para antes de chegar la, mas o texto traduzido, sendo mais
+    longo, pode nao parar e vazar por cima do texto do bloco vizinho."""
+    bbox = fitz.Rect(bloco_info["bbox"])
+    x1_seguro = bbox.x1
+    for outro in outros_blocos_normais:
+        if outro is bloco_info:
+            continue
+        obbox = fitz.Rect(outro["bbox"])
+        if obbox.x0 <= bbox.x0:
+            continue  # nao esta a direita deste bloco
+        sobreposicao_vertical = min(bbox.y1, obbox.y1) - max(bbox.y0, obbox.y0)
+        if sobreposicao_vertical <= 0:
+            continue  # nao compartilha faixa vertical, nao tem risco de colisao
+        if obbox.x0 < x1_seguro:
+            x1_seguro = obbox.x0
+    # nunca deixa a caixa vazia/absurdamente estreita — garante ao menos 10pt.
+    return max(x1_seguro - 1.5, bbox.x0 + 10)
 
 
 def _rect_center_inside(bbox, rect: fitz.Rect) -> bool:
@@ -214,7 +273,7 @@ def _avisar_colisao_com_conteudo_visual(
     for info in block_infos:
         if info["tabela"]:
             continue
-        bbox = fitz.Rect(info["bbox"])
+        bbox = fitz.Rect(info.get("bbox_redacao", info["bbox"]))
         for protegido in protegidos:
             sobreposicao = bbox & protegido
             if sobreposicao.is_empty:
@@ -229,9 +288,9 @@ def _avisar_colisao_com_conteudo_visual(
                 )
 
 
-def _merged_lines_runs(blocks: list[dict]) -> list[list[list]]:
+def _merged_lines_runs(blocks: list[dict]) -> list[tuple[list[list], tuple]]:
     """Junta as linhas de varios blocos (ex.: todos os blocos dentro de uma
-    celula de tabela) numa unica lista de linhas com runs por negrito."""
+    celula de tabela) numa unica lista de (runs, bbox) por linha."""
     lines_runs = []
     for b in blocks:
         if b.get("type") != 0:
@@ -312,7 +371,7 @@ def process_pdf(
             if not lines_runs or not _has_visible_text(lines_runs):
                 continue
             run_indices = []
-            for line_runs in lines_runs:
+            for line_runs, _bbox in lines_runs:
                 for run in line_runs:
                     run_indices.append(len(flat_originals))
                     flat_originals.append(run[0])
@@ -329,29 +388,44 @@ def process_pdf(
 
         # Blocos normais de texto, pulando qualquer bloco que caia dentro de
         # uma area de tabela (esse ja foi tratado acima, celula por celula).
+        # Cada bloco pode ser dividido em varios sub-blocos (ver
+        # _dividir_em_subblocos) quando parece misturar conteudo de fileiras
+        # diferentes — a redacao (Fase 1) sempre usa a bbox do bloco INTEIRO
+        # original (bbox_redacao), garantindo que tudo seja apagado mesmo
+        # quando a insercao (Fase 2) usa a bbox mais justa de cada sub-bloco.
         blocks = [b for b in page.get_text("dict")["blocks"] if b.get("type") == 0]
         for b in blocks:
             if any(_rect_center_inside(b["bbox"], area) for area in table_areas):
                 continue
-            lines_runs = _block_lines_runs(b)
-            if not lines_runs or not _has_visible_text(lines_runs):
+            lines_runs_bloco = _block_lines_runs(b)
+            if not lines_runs_bloco or not _has_visible_text(lines_runs_bloco):
                 continue
             first_span = b["lines"][0]["spans"][0]
-            run_indices = []
-            for line_runs in lines_runs:
-                for run in line_runs:
-                    run_indices.append(len(flat_originals))
-                    flat_originals.append(run[0])
-            block_infos.append(
-                {
-                    "bbox": b["bbox"],
-                    "lines_runs": lines_runs,
-                    "run_indices": run_indices,
-                    "size": first_span["size"],
-                    "color": first_span["color"],
-                    "tabela": False,
-                }
-            )
+            for subgrupo in _dividir_em_subblocos(lines_runs_bloco):
+                if not subgrupo or not _has_visible_text(subgrupo):
+                    continue
+                bbox_subgrupo = (
+                    min(bbox[0] for _r, bbox in subgrupo),
+                    min(bbox[1] for _r, bbox in subgrupo),
+                    max(bbox[2] for _r, bbox in subgrupo),
+                    max(bbox[3] for _r, bbox in subgrupo),
+                )
+                run_indices = []
+                for line_runs, _bbox in subgrupo:
+                    for run in line_runs:
+                        run_indices.append(len(flat_originals))
+                        flat_originals.append(run[0])
+                block_infos.append(
+                    {
+                        "bbox": bbox_subgrupo,
+                        "bbox_redacao": b["bbox"],
+                        "lines_runs": subgrupo,
+                        "run_indices": run_indices,
+                        "size": first_span["size"],
+                        "color": first_span["color"],
+                        "tabela": False,
+                    }
+                )
 
         if not block_infos:
             if on_progress:
@@ -367,21 +441,33 @@ def process_pdf(
         # apague pedaco do texto ja inserido de outro bloco, quando as caixas
         # originais se encostam/leve sobreposicao de bbox).
         for info in block_infos:
-            bbox = fitz.Rect(info["bbox"])
+            bbox = fitz.Rect(info.get("bbox_redacao", info["bbox"]))
             cor_fundo = _cor_fundo_do_bloco(bbox, fundos_coloridos)
             page.add_redact_annot(bbox, fill=cor_fundo)
         page.apply_redactions()
 
         # Fase 2: insere o texto traduzido de cada bloco.
+        blocos_normais = [i for i in block_infos if not i["tabela"]]
         for info in block_infos:
-            rect = fitz.Rect(info["bbox"])
+            bbox_original = fitz.Rect(info["bbox"])
+            if info["tabela"]:
+                rect = bbox_original
+            else:
+                # Usa uma largura de insercao possivelmente mais estreita que
+                # a bbox original, pra nao vazar em cima de um bloco vizinho
+                # a direita (ver _largura_segura_x1). A redacao da Fase 1 ja
+                # usou a bbox original inteira, entao isso so afeta onde o
+                # texto NOVO pode ocupar, nao o que foi apagado.
+                x1_seguro = _largura_segura_x1(info, blocos_normais)
+                rect = fitz.Rect(bbox_original.x0, bbox_original.y0, x1_seguro, bbox_original.y1)
             color = info["color"]
             color_hex = "#{:06x}".format(color if color else 0)
 
             idx_iter = iter(info["run_indices"])
             html_lines: list[str] = []
             prefixo_pendente = ""
-            for line_runs in info["lines_runs"]:
+            linha_anterior_era_wrap = False
+            for line_runs, _line_bbox in info["lines_runs"]:
                 parts = []
                 for text, bold in line_runs:
                     i = next(idx_iter)
@@ -399,10 +485,30 @@ def process_pdf(
                 texto_puro = "".join(t for t, _ in line_runs).strip()
                 if len(line_runs) == 1 and texto_puro in _MARCADORES_SOLTOS:
                     prefixo_pendente = linha_html + " "
+                    linha_anterior_era_wrap = False
                     continue
 
-                html_lines.append(prefixo_pendente + linha_html)
+                # Se a linha ANTERIOR nao termina em pontuacao final (. : ; ! ?),
+                # ela quase certamente era so um ponto de quebra de largura de
+                # coluna no PDF original (word-wrap no meio da frase), nao uma
+                # quebra de verdade — usar largura da bbox pra decidir isso se
+                # mostrou pouco confiavel neste tipo de documento (blocos as
+                # vezes misturam fragmentos de linhas/colunas vizinhas, o que
+                # distorce a largura "esperada" do bloco). Pontuacao final e um
+                # sinal muito mais direto de fim de frase/rotulo. Quando e so
+                # quebra de largura, junta com espaco em vez de <br> — assim o
+                # texto traduzido (que pode ter tamanho bem diferente do
+                # original) se reorganiza sozinho dentro da caixa no
+                # insert_htmlbox, em vez de ficar preso exatamente nos mesmos
+                # pontos de quebra do idioma de origem (o que causava texto
+                # traduzido mais longo sobrepondo a linha seguinte).
+                if html_lines and not prefixo_pendente and linha_anterior_era_wrap:
+                    html_lines[-1] = html_lines[-1] + " " + linha_html
+                else:
+                    html_lines.append(prefixo_pendente + linha_html)
                 prefixo_pendente = ""
+
+                linha_anterior_era_wrap = not texto_puro.rstrip().endswith((".", ":", ";", "!", "?"))
             if prefixo_pendente:
                 html_lines.append(prefixo_pendente)
             html_content = "<br>".join(html_lines)
