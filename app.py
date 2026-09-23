@@ -21,6 +21,7 @@ from pydantic import BaseModel
 
 from pipeline import (
     _aplicar_traducao_em_paragrafos,
+    custo_centavos_brl,
     gerar_imagem_previa_docx,
     process_docx,
     process_pdf,
@@ -304,6 +305,17 @@ def _processar_job_completo(job: dict):
         except Exception:
             pass  # nunca derruba o processamento por causa de um update de progresso
 
+    # Soma os tokens de TODAS as chamadas de traducao do job (varias por
+    # pagina/lote) pra calcular o custo real de IA no final — inclusive se o
+    # job falhar no meio, os tokens ja gastos ate ali continuam sendo custo
+    # de verdade, entao o total acumulado e salvo nos dois caminhos (sucesso
+    # e erro), nao so no sucesso.
+    uso_acumulado = {"prompt_tokens": 0, "completion_tokens": 0}
+
+    def registrar_uso(usage: dict):
+        uso_acumulado["prompt_tokens"] += usage.get("prompt_tokens", 0)
+        uso_acumulado["completion_tokens"] += usage.get("completion_tokens", 0)
+
     try:
         conteudo = _baixar_do_storage(job["arquivo_original_path"])
 
@@ -313,9 +325,23 @@ def _processar_job_completo(job: dict):
             destino = Path(tmp) / f"traduzido{sufixo}"
 
             if sufixo == ".pdf":
-                process_pdf(origem, destino, job["idioma_origem"], job["idioma_destino"], on_progress=progresso)
+                process_pdf(
+                    origem,
+                    destino,
+                    job["idioma_origem"],
+                    job["idioma_destino"],
+                    on_progress=progresso,
+                    on_uso=registrar_uso,
+                )
             else:
-                process_docx(origem, destino, job["idioma_origem"], job["idioma_destino"], on_progress=progresso)
+                process_docx(
+                    origem,
+                    destino,
+                    job["idioma_origem"],
+                    job["idioma_destino"],
+                    on_progress=progresso,
+                    on_uso=registrar_uso,
+                )
 
             traduzido_bytes = destino.read_bytes()
 
@@ -326,6 +352,13 @@ def _processar_job_completo(job: dict):
             else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         )
         _subir_para_storage(caminho_traduzido, traduzido_bytes, content_type)
-        _atualizar_job(job_id, {"status": "pronto", "arquivo_traduzido_path": caminho_traduzido})
+        custo_centavos = custo_centavos_brl(uso_acumulado["prompt_tokens"], uso_acumulado["completion_tokens"])
+        _atualizar_job(
+            job_id,
+            {"status": "pronto", "arquivo_traduzido_path": caminho_traduzido, "custo_ia_centavos": custo_centavos},
+        )
     except Exception as exc:
-        _atualizar_job(job_id, {"status": "erro", "erro_mensagem": str(exc)[:2000]})
+        custo_centavos = custo_centavos_brl(uso_acumulado["prompt_tokens"], uso_acumulado["completion_tokens"])
+        _atualizar_job(
+            job_id, {"status": "erro", "erro_mensagem": str(exc)[:2000], "custo_ia_centavos": custo_centavos}
+        )

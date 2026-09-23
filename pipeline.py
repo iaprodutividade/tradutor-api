@@ -27,6 +27,22 @@ load_dotenv(Path(__file__).parent / ".env")
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 MODEL = "gpt-4o-mini"
 
+# Preco por token do modelo em uso — conferido na OpenAI em 23/09/2026
+# (https://openai.com/api/pricing): US$0,15 / 1M tokens de entrada,
+# US$0,60 / 1M tokens de saida. Cotacao do dolar configuravel via env (o
+# valor exato do extrato do cartao varia dia a dia — isso e uma
+# aproximacao do custo real, nao o valor exato faturado).
+PRECO_INPUT_USD_POR_1M = 0.15
+PRECO_OUTPUT_USD_POR_1M = 0.60
+USD_BRL_TAXA = float(os.environ.get("USD_BRL_TAXA", "5.15"))
+
+
+def custo_centavos_brl(prompt_tokens: int, completion_tokens: int) -> int:
+    custo_usd = (prompt_tokens / 1_000_000) * PRECO_INPUT_USD_POR_1M + (
+        completion_tokens / 1_000_000
+    ) * PRECO_OUTPUT_USD_POR_1M
+    return round(custo_usd * USD_BRL_TAXA * 100)
+
 SYSTEM_PROMPT = """Voce e um tradutor tecnico. Traduza cada item da lista do idioma de \
 origem para o idioma de destino, mantendo o significado tecnico exato.
 
@@ -43,7 +59,7 @@ Devolva APENAS um JSON com a chave "traducoes": lista de strings, na MESMA ORDEM
 MESMA QUANTIDADE da lista de entrada."""
 
 
-def _call_translate(texts: list[str], source_lang: str, target_lang: str) -> list[str]:
+def _call_translate(texts: list[str], source_lang: str, target_lang: str) -> tuple[list[str], dict]:
     user_payload = {
         "idioma_origem": source_lang,
         "idioma_destino": target_lang,
@@ -59,15 +75,29 @@ def _call_translate(texts: list[str], source_lang: str, target_lang: str) -> lis
         response_format={"type": "json_object"},
     )
     data = json.loads(resp.choices[0].message.content)
-    return data["traducoes"]
+    usage = {
+        "prompt_tokens": resp.usage.prompt_tokens if resp.usage else 0,
+        "completion_tokens": resp.usage.completion_tokens if resp.usage else 0,
+    }
+    return data["traducoes"], usage
 
 
-def translate_batch(texts: list[str], source_lang: str, target_lang: str) -> list[str]:
+def translate_batch(
+    texts: list[str],
+    source_lang: str,
+    target_lang: str,
+    on_uso: Callable[[dict], None] | None = None,
+) -> list[str]:
     if not texts:
         return []
 
     for attempt in range(2):
-        out = _call_translate(texts, source_lang, target_lang)
+        out, usage = _call_translate(texts, source_lang, target_lang)
+        # Toda chamada de verdade custa dinheiro, inclusive a que vai ser
+        # descartada por causa de divergencia de contagem — por isso o
+        # aviso ao chamador acontece aqui dentro, nao so no caminho feliz.
+        if on_uso:
+            on_uso(usage)
         if len(out) == len(texts):
             return out
         print(f"[aviso] tentativa {attempt + 1}: esperava {len(texts)} traducoes, recebi {len(out)} — repetindo")
@@ -306,12 +336,15 @@ def process_pdf(
     target_lang: str,
     page_indices: list[int] | None = None,
     on_progress: Callable[[int, int], None] | None = None,
+    on_uso: Callable[[dict], None] | None = None,
 ):
     """page_indices=None processa o documento inteiro; uma lista processa só
     essas páginas (0-based) — usado pela prévia grátis (só a 1ª página).
     on_progress(paginas_feitas, paginas_total), se passado, é chamado depois
     de cada página terminar — usado pra barra de progresso do documento
-    completo pós-pagamento."""
+    completo pós-pagamento. on_uso({"prompt_tokens", "completion_tokens"}),
+    se passado, é chamado a cada chamada de tradução — usado pra calcular o
+    custo real de IA do job."""
     doc = fitz.open(input_path)
     pages = [doc[i] for i in page_indices] if page_indices is not None else doc
     total_paginas_a_processar = len(pages)
@@ -434,7 +467,7 @@ def process_pdf(
 
         _avisar_colisao_com_conteudo_visual(page, block_infos, table_areas)
 
-        flat_translations = translate_batch(flat_originals, source_lang, target_lang)
+        flat_translations = translate_batch(flat_originals, source_lang, target_lang, on_uso=on_uso)
 
         # Fase 1: marca e aplica TODAS as redacoes da pagina de uma vez, antes de
         # inserir qualquer texto novo (evita que a redacao de um bloco vizinho
@@ -585,9 +618,12 @@ def process_docx(
     source_lang: str,
     target_lang: str,
     on_progress: Callable[[int, int], None] | None = None,
+    on_uso: Callable[[dict], None] | None = None,
 ):
     """on_progress(paragrafos_feitos, paragrafos_total), se passado, é
-    chamado depois de cada lote traduzido — usado pra barra de progresso."""
+    chamado depois de cada lote traduzido — usado pra barra de progresso.
+    on_uso({"prompt_tokens", "completion_tokens"}), se passado, é chamado a
+    cada chamada de tradução — usado pra calcular o custo real de IA do job."""
     doc = Document(input_path)
     paragraphs = list(_iter_runs_text_units(doc))
     originals = [p.text for p in paragraphs]
@@ -596,7 +632,7 @@ def process_docx(
     BATCH = 40
     translations: list[str] = []
     for i in range(0, len(originals), BATCH):
-        translations.extend(translate_batch(originals[i : i + BATCH], source_lang, target_lang))
+        translations.extend(translate_batch(originals[i : i + BATCH], source_lang, target_lang, on_uso=on_uso))
         if on_progress:
             on_progress(len(translations), len(originals))
 
