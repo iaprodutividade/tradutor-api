@@ -21,6 +21,7 @@ from pydantic import BaseModel
 
 from pipeline import (
     _aplicar_traducao_em_paragrafos,
+    analisar_texto_extraivel,
     custo_centavos_brl,
     gerar_imagem_previa_docx,
     process_docx,
@@ -145,7 +146,20 @@ def _preview_pdf(origem: Path, tmp: Path, idioma_origem: str, idioma_destino: st
     total_paginas = len(doc_original)
     pix_original = doc_original[0].get_pixmap(dpi=200)
     imagem_original_b64 = base64.b64encode(pix_original.tobytes("png")).decode()
+    analise_texto = analisar_texto_extraivel(doc_original)
     doc_original.close()
+
+    if analise_texto["eh_imagem"]:
+        # PDF sem camada de texto real (imagem/foto achatada) — o pipeline
+        # de redação/reinserção não tem o que extrair aqui. Não roda
+        # process_pdf (sairia idêntico ao original, sem avisar ninguém) e
+        # devolve um tipo à parte pro frontend mostrar o aviso em vez da
+        # prévia normal.
+        return {
+            "tipo": "pdf_sem_texto",
+            "paginas_total": total_paginas,
+            "imagem_original_base64": imagem_original_b64,
+        }
 
     traduzido = tmp / "traduzido.pdf"
     process_pdf(origem, traduzido, idioma_origem, idioma_destino, page_indices=[0])

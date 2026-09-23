@@ -329,6 +329,37 @@ def _merged_lines_runs(blocks: list[dict]) -> list[tuple[list[list], tuple]]:
     return lines_runs
 
 
+# Limiar pra decidir se um PDF tem texto real extraivel ou e so imagem
+# achatada (catalogo exportado do Canva, digitalizacao, PDF "para
+# impressao" que achata tudo etc.). O pipeline abaixo depende de blocos de
+# texto reais (bbox) pra redatar/reinserir — sem eles nao ha nada pra
+# traduzir, e o resultado sairia visualmente identico ao original, 100% no
+# idioma de origem, sem nenhum erro visivel pro sistema (cobraria sem
+# entregar). Caso real que motivou isso documentado em
+# claude-sessions-log/sessions/2026-09-23_tradutor-pdf-imagem-*.md.
+CARACTERES_MINIMOS_TEXTO_PAGINA = 30
+RAZAO_MINIMA_PAGINAS_COM_TEXTO = 0.34
+
+
+def analisar_texto_extraivel(doc: fitz.Document, max_paginas_checar: int = 5) -> dict:
+    """Checa as primeiras `max_paginas_checar` páginas e estima se o PDF tem
+    camada de texto real. Retorna eh_imagem=True quando a fração de páginas
+    com texto de verdade fica abaixo do limiar — sinal forte de PDF achatado
+    (imagem pura), não de documento com pouco texto por página."""
+    paginas_checar = min(len(doc), max_paginas_checar)
+    paginas_com_texto = 0
+    for i in range(paginas_checar):
+        texto = doc[i].get_text("text").strip()
+        if len(texto) >= CARACTERES_MINIMOS_TEXTO_PAGINA:
+            paginas_com_texto += 1
+    razao = paginas_com_texto / paginas_checar if paginas_checar else 0
+    return {
+        "paginas_checadas": paginas_checar,
+        "paginas_com_texto": paginas_com_texto,
+        "eh_imagem": razao < RAZAO_MINIMA_PAGINAS_COM_TEXTO,
+    }
+
+
 def process_pdf(
     input_path: Path,
     output_path: Path,
