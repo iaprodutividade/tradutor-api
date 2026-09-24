@@ -214,61 +214,92 @@ def _n_paginas_previa_imagem(total_paginas: int) -> int:
     return max(2, min(5, total_paginas // 2 or 2))
 
 
-@app.post("/preview-imagem")
-async def preview_imagem(
-    request: Request,
-    arquivo: UploadFile = File(...),
-    idioma_origem: str = Form(...),
-    idioma_destino: str = Form(...),
+class GerarPreviaImagemBody(BaseModel):
+    job_id: str
+
+
+@app.post("/gerar-previa-imagem", status_code=202)
+async def gerar_previa_imagem(
+    body: GerarPreviaImagemBody,
+    background_tasks: BackgroundTasks,
     x_api_key: str | None = Header(default=None),
 ):
-    """Processa de verdade as primeiras páginas de um PDF-imagem (sem
-    texto extraível) — chamado pelo frontend depois que /preview já
-    identificou o arquivo como tipo "pdf_sem_texto". Mais lento que o
-    /preview normal (roda OCR + LaMa + tradução de verdade), por isso é
-    uma rota separada, só acionada quando o visitante confirma que quer
-    seguir com o processamento especial."""
+    """Dispara o processamento de verdade das primeiras páginas de um
+    PDF-imagem em segundo plano. Assíncrono (202 + polling) igual ao
+    /traduzir-completo, não porque o Robson pediu, mas porque uma chamada
+    só levaria 1-2min — mais tempo do que uma função serverless do Vercel
+    aguenta segurar aberta numa chamada síncrona. O arquivo já precisa
+    estar no Storage (feito no upload, junto com a criação do job) e o
+    job precisa existir com status "aguardando_previa_imagem"."""
     _checar_api_key(x_api_key)
-    _checar_rate_limit(_ip_do_cliente(request))
+    if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Supabase não configurado no backend.")
 
-    conteudo = await arquivo.read()
-    if len(conteudo) > MAX_TAMANHO_ARQUIVO:
-        raise HTTPException(status_code=413, detail="Arquivo muito grande (limite de 15 MB).")
+    job = _buscar_job(body.job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job não encontrado")
+    if job["status"] != "aguardando_previa_imagem":
+        # Idempotente: um clique duplo ou um retry nao deve disparar o
+        # processamento pesado duas vezes.
+        return {"ok": True, "ignorado": f"status atual é {job['status']}"}
 
-    with tempfile.TemporaryDirectory() as tmp:
-        origem = Path(tmp) / "origem.pdf"
-        origem.write_bytes(conteudo)
-        saida = Path(tmp) / "previa.pdf"
+    _atualizar_job(body.job_id, {"status": "gerando_previa_imagem"})
+    background_tasks.add_task(_processar_previa_imagem, job)
+    return {"ok": True}
 
-        doc = fitz.open(origem)
-        total_paginas = len(doc)
-        indices = list(range(_n_paginas_previa_imagem(total_paginas)))
-        areas_protegidas = detectar_elementos_repetidos(doc, indices) if len(indices) >= 2 else {}
-        doc.close()
 
-        process_pdf_imagem(
-            origem,
-            saida,
-            idioma_origem,
-            idioma_destino,
-            page_indices=indices,
-            areas_protegidas_por_pagina=areas_protegidas,
+def _processar_previa_imagem(job: dict):
+    job_id = job["id"]
+
+    def progresso(feitas: int, total: int):
+        try:
+            _atualizar_job(job_id, {"unidades_processadas": feitas, "unidades_total": total})
+        except Exception:
+            pass  # nunca derruba o processamento por causa de um update de progresso
+
+    try:
+        conteudo = _baixar_do_storage(job["arquivo_original_path"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            origem = Path(tmp) / "origem.pdf"
+            origem.write_bytes(conteudo)
+            saida = Path(tmp) / "previa.pdf"
+
+            doc = fitz.open(origem)
+            total_paginas = len(doc)
+            indices = list(range(_n_paginas_previa_imagem(total_paginas)))
+            areas_protegidas = detectar_elementos_repetidos(doc, indices) if len(indices) >= 2 else {}
+            doc.close()
+
+            process_pdf_imagem(
+                origem,
+                saida,
+                job["idioma_origem"],
+                job["idioma_destino"],
+                page_indices=indices,
+                areas_protegidas_por_pagina=areas_protegidas,
+                on_progress=progresso,
+            )
+
+            doc_previa = fitz.open(saida)
+            caminhos = []
+            for i, page in enumerate(doc_previa):
+                pix = page.get_pixmap(dpi=150)
+                caminho = f"previas/{job_id}/{i}.png"
+                _subir_para_storage(caminho, pix.tobytes("png"), "image/png")
+                caminhos.append(caminho)
+            doc_previa.close()
+
+        _atualizar_job(
+            job_id,
+            {
+                "status": "previa_imagem_pronta",
+                "previas_imagem_paths": caminhos,
+                "preco_centavos": _calcular_preco_imagem(total_paginas),
+            },
         )
-
-        doc_previa = fitz.open(saida)
-        imagens_previa_b64 = []
-        for page in doc_previa:
-            pix = page.get_pixmap(dpi=150)
-            imagens_previa_b64.append(base64.b64encode(pix.tobytes("png")).decode())
-        doc_previa.close()
-
-    return {
-        "tipo": "pdf_imagem_processado",
-        "paginas_total": total_paginas,
-        "paginas_previa": len(indices),
-        "preco_centavos": _calcular_preco_imagem(total_paginas),
-        "imagens_previa_base64": imagens_previa_b64,
-    }
+    except Exception as e:
+        _atualizar_job(job_id, {"status": "erro", "erro_mensagem": str(e)[:500]})
 
 
 LIMITE_PARAGRAFOS_PREVIA = 12
