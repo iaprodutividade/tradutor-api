@@ -21,10 +21,13 @@ from pydantic import BaseModel
 
 from pipeline import (
     _aplicar_traducao_em_paragrafos,
+    analisar_texto_extraivel,
     custo_centavos_brl,
+    detectar_elementos_repetidos,
     gerar_imagem_previa_docx,
     process_docx,
     process_pdf,
+    process_pdf_imagem,
     translate_batch,
 )
 
@@ -145,7 +148,20 @@ def _preview_pdf(origem: Path, tmp: Path, idioma_origem: str, idioma_destino: st
     total_paginas = len(doc_original)
     pix_original = doc_original[0].get_pixmap(dpi=200)
     imagem_original_b64 = base64.b64encode(pix_original.tobytes("png")).decode()
+    analise_texto = analisar_texto_extraivel(doc_original)
     doc_original.close()
+
+    if analise_texto["eh_imagem"]:
+        # PDF sem camada de texto real (imagem/foto achatada) — o pipeline
+        # de redação/reinserção não tem o que extrair aqui. Não roda
+        # process_pdf (sairia idêntico ao original, sem avisar ninguém) e
+        # devolve um tipo à parte pro frontend mostrar o aviso em vez da
+        # prévia normal.
+        return {
+            "tipo": "pdf_sem_texto",
+            "paginas_total": total_paginas,
+            "imagem_original_base64": imagem_original_b64,
+        }
 
     traduzido = tmp / "traduzido.pdf"
     process_pdf(origem, traduzido, idioma_origem, idioma_destino, page_indices=[0])
@@ -171,6 +187,141 @@ def _preview_pdf(origem: Path, tmp: Path, idioma_origem: str, idioma_destino: st
         "imagem_traduzida_base64": imagem_traduzida_b64,
         "pdf_traduzido_base64": pdf_traduzido_b64,
     }
+
+
+# Faixas de preço do PDF-imagem — mesmo padrão de FAIXAS_PRECO (documento
+# inteiro numa faixa só, sem degrau brusco), mas com piso mais caro e mais
+# alto que o texto em qualquer volume: o processamento é mais pesado (OCR +
+# inpaint + reescrita, praticamente sequencial por página numa VPS de CPU
+# limitada) e é um diferencial sem alternativa no mercado, então não faz
+# sentido correr pro mesmo piso do texto (R$3,00) só porque o documento é
+# grande. Decisão de 24/09/2026 com o Robson, depois de discutir a
+# economia unitária.
+FAIXAS_PRECO_IMAGEM = [
+    (15, 1000),  # até 15 páginas: R$10,00/página
+    (50, 800),  # 16-50: R$8,00/página (20% off)
+    (100, 600),  # 51-100: R$6,00/página (40% off)
+    (float("inf"), 500),  # 100+: R$5,00/página (50% off)
+]
+
+
+def _preco_por_pagina_imagem_centavos(paginas: int) -> int:
+    for limite, preco in FAIXAS_PRECO_IMAGEM:
+        if paginas <= limite:
+            return preco
+    return FAIXAS_PRECO_IMAGEM[-1][1]
+
+
+def _calcular_preco_imagem(paginas: int) -> int:
+    preco_pagina = _preco_por_pagina_imagem_centavos(paginas)
+    return max(PRECO_MINIMO_CENTAVOS, paginas * preco_pagina)
+
+
+# Quantas páginas processar de verdade pra prévia do PDF-imagem antes de
+# cobrar — 5 páginas ou metade do documento, o que for menor (decisão do
+# Robson: pra documento curto, "5 primeiras" seria quase o documento
+# inteiro de graça). Mínimo de 2 quando o documento tem 2+ páginas: com
+# só 1 página na prévia, detectar_elementos_repetidos não tem o que
+# comparar entre páginas e a logo fica sem proteção — foi um bug real
+# visto num teste com documento de 2 páginas. Documento de exatamente 1
+# página segue sem proteção automática de logo (limitação conhecida, não
+# resolvida — precisaria de outro sinal, não cross-página).
+def _n_paginas_previa_imagem(total_paginas: int) -> int:
+    if total_paginas <= 1:
+        return 1
+    return max(2, min(5, total_paginas // 2 or 2))
+
+
+class GerarPreviaImagemBody(BaseModel):
+    job_id: str
+
+
+@app.post("/gerar-previa-imagem", status_code=202)
+async def gerar_previa_imagem(
+    body: GerarPreviaImagemBody,
+    background_tasks: BackgroundTasks,
+    x_api_key: str | None = Header(default=None),
+):
+    """Dispara o processamento de verdade das primeiras páginas de um
+    PDF-imagem em segundo plano. Assíncrono (202 + polling) igual ao
+    /traduzir-completo, não porque o Robson pediu, mas porque uma chamada
+    só levaria 1-2min — mais tempo do que uma função serverless do Vercel
+    aguenta segurar aberta numa chamada síncrona. O arquivo já precisa
+    estar no Storage (feito no upload, junto com a criação do job) e o
+    job precisa existir com status "aguardando_previa_imagem"."""
+    _checar_api_key(x_api_key)
+    if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Supabase não configurado no backend.")
+
+    job = _buscar_job(body.job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job não encontrado")
+    if job["status"] != "aguardando_previa_imagem":
+        # Idempotente: um clique duplo ou um retry nao deve disparar o
+        # processamento pesado duas vezes.
+        return {"ok": True, "ignorado": f"status atual é {job['status']}"}
+
+    _atualizar_job(body.job_id, {"status": "gerando_previa_imagem"})
+    background_tasks.add_task(_processar_previa_imagem, job)
+    return {"ok": True}
+
+
+def _processar_previa_imagem(job: dict):
+    job_id = job["id"]
+
+    def progresso(feitas: int, total: int):
+        try:
+            _atualizar_job(job_id, {"unidades_processadas": feitas, "unidades_total": total})
+        except Exception:
+            pass  # nunca derruba o processamento por causa de um update de progresso
+
+    try:
+        conteudo = _baixar_do_storage(job["arquivo_original_path"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            origem = Path(tmp) / "origem.pdf"
+            origem.write_bytes(conteudo)
+            saida = Path(tmp) / "previa.pdf"
+
+            doc = fitz.open(origem)
+            total_paginas = len(doc)
+            indices = list(range(_n_paginas_previa_imagem(total_paginas)))
+            if len(indices) >= 2:
+                areas_protegidas, blocos_ocr_cache = detectar_elementos_repetidos(doc, indices)
+            else:
+                areas_protegidas, blocos_ocr_cache = {}, {}
+            doc.close()
+
+            process_pdf_imagem(
+                origem,
+                saida,
+                job["idioma_origem"],
+                job["idioma_destino"],
+                page_indices=indices,
+                areas_protegidas_por_pagina=areas_protegidas,
+                blocos_ocr_cache=blocos_ocr_cache,
+                on_progress=progresso,
+            )
+
+            doc_previa = fitz.open(saida)
+            caminhos = []
+            for i, page in enumerate(doc_previa):
+                pix = page.get_pixmap(dpi=150)
+                caminho = f"previas/{job_id}/{i}.png"
+                _subir_para_storage(caminho, pix.tobytes("png"), "image/png")
+                caminhos.append(caminho)
+            doc_previa.close()
+
+        _atualizar_job(
+            job_id,
+            {
+                "status": "previa_imagem_pronta",
+                "previas_imagem_paths": caminhos,
+                "preco_centavos": _calcular_preco_imagem(total_paginas),
+            },
+        )
+    except Exception as e:
+        _atualizar_job(job_id, {"status": "erro", "erro_mensagem": str(e)[:500]})
 
 
 LIMITE_PARAGRAFOS_PREVIA = 12
@@ -324,7 +475,33 @@ def _processar_job_completo(job: dict):
             origem.write_bytes(conteudo)
             destino = Path(tmp) / f"traduzido{sufixo}"
 
-            if sufixo == ".pdf":
+            if job["tipo_arquivo"] == "pdf_sem_texto":
+                # Mesmo pipeline da prévia (OCR + inpaint + reescrita),
+                # mas sem o corte de páginas — page_indices=None processa
+                # o documento inteiro. A detecção de logo roda nas páginas
+                # todas agora (não só nas poucas da prévia): documento
+                # grande pode ter template de página diferente que só
+                # aparece depois da 5ª página, e mais páginas = amostra
+                # melhor pra achar o que se repete de verdade.
+                doc = fitz.open(origem)
+                indices_completos = list(range(len(doc)))
+                if len(indices_completos) >= 2:
+                    areas_protegidas, blocos_ocr_cache = detectar_elementos_repetidos(doc, indices_completos)
+                else:
+                    areas_protegidas, blocos_ocr_cache = {}, {}
+                doc.close()
+
+                process_pdf_imagem(
+                    origem,
+                    destino,
+                    job["idioma_origem"],
+                    job["idioma_destino"],
+                    areas_protegidas_por_pagina=areas_protegidas,
+                    blocos_ocr_cache=blocos_ocr_cache,
+                    on_progress=progresso,
+                    on_uso=registrar_uso,
+                )
+            elif sufixo == ".pdf":
                 process_pdf(
                     origem,
                     destino,

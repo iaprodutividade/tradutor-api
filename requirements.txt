@@ -2,7 +2,24 @@ pymupdf>=1.28.2
 python-docx>=1.2.0
 openai>=3.16.2
 python-dotenv>=1.2.3
-fastapi>=0.115
+# fastapi travado em 0.108.0 -- o iopaint (toda versao ate 1.6.0, a mais
+# recente) exige exatamente essa versao (==), nao da pra usar >= aqui. Sem
+# isso o pip nao resolve as dependencias (visto na pratica: build quebrou
+# na VPS por causa disso).
+fastapi==0.108.0
 uvicorn[standard]>=0.32
 python-multipart>=0.0.12
 httpx>=0.27
+# Pillow tambem travado -- mesmo motivo do fastapi acima, iopaint exige
+# exatamente 9.5.0 em todas as versoes ate a 1.6.0 (a mais recente).
+Pillow==9.5.0
+numpy>=1.26
+# paddleocr/paddlepaddle removidos: o motor nativo do PaddlePaddle trava
+# com SIGSEGV/SIGABRT em ARM64 dentro de Docker (bug conhecido, ainda sem
+# solucao da equipe do PaddlePaddle, confirmado em varios relatos
+# independentes no GitHub). rapidocr usa os MESMOS modelos PP-OCR, mas via
+# ONNX Runtime em vez do motor nativo do Paddle -- mesma qualidade de
+# reconhecimento, sem o bug de arquitetura.
+rapidocr>=2.0
+onnxruntime>=1.18
+iopaint>=1.4
