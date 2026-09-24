@@ -23,6 +23,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY fontconfig/29-aptos-substitute.conf /etc/fonts/conf.d/29-aptos-substitute.conf
 RUN fc-cache -f
+# Instala o torch CPU-only ANTES do requirements.txt -- iopaint nao fixa
+# versao de torch, entao o pip resolve pra ultima disponivel, que por padrao
+# vem com CUDA (pacotes nvidia-*/triton, uteis so com GPU). Essa VPS e
+# ARM64 sem GPU nenhuma (Oracle A1.Flex) -- a variante CUDA nunca roda o
+# codigo dela, so ocupa ~5GB de imagem a toa. Fixado na mesma versao que o
+# iopaint ja resolvia (2.14.0) pra nao conflitar com o requirement dele.
+RUN pip install --no-cache-dir torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
