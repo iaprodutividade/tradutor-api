@@ -389,20 +389,18 @@ _inpaint_model_manager = None
 def _get_ocr_engine():
     global _ocr_engine
     if _ocr_engine is None:
-        from paddleocr import PaddleOCR
+        # PaddleOCR (motor nativo do PaddlePaddle) trava com
+        # SIGSEGV/SIGABRT em ARM64 dentro de Docker — bug conhecido e
+        # ainda sem solução (varios relatos independentes no GitHub do
+        # PaddlePaddle, incluindo tentativas de desligar mkldnn como a
+        # linha acima fazia, sem efeito). RapidOCR usa os MESMOS modelos
+        # PP-OCR, mas via ONNX Runtime — mesma qualidade de
+        # reconhecimento, sem o bug de arquitetura. Fica no modelo
+        # "small" (padrão): testado "medium" e saiu mais lento (~50s por
+        # página vs ~7s) e não mais preciso.
+        from rapidocr import RapidOCR
 
-        # enable_mkldnn=False evita um crash conhecido (NotImplementedError
-        # do oneDNN) na build CPU do PaddlePaddle pra Windows — não
-        # confirmado se é necessário no Linux da VPS; controlável por env
-        # var pra testar os dois casos sem mudar código.
-        habilitar_mkldnn = os.environ.get("PADDLEOCR_ENABLE_MKLDNN", "true").lower() != "false"
-        _ocr_engine = PaddleOCR(
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            lang="pt",
-            enable_mkldnn=habilitar_mkldnn,
-        )
+        _ocr_engine = RapidOCR()
     return _ocr_engine
 
 
@@ -423,14 +421,30 @@ def _ocr_blocos_pagina(imagem_pil) -> list[dict]:
     import numpy as np
 
     ocr = _get_ocr_engine()
-    resultado = ocr.predict(np.array(imagem_pil.convert("RGB")))[0]
+    resultado = ocr(np.array(imagem_pil.convert("RGB")))
     blocos = []
-    for texto, score, poly in zip(resultado["rec_texts"], resultado["rec_scores"], resultado["rec_polys"]):
+    if not resultado.txts:
+        return blocos
+    for texto, score, poly in zip(resultado.txts, resultado.scores, resultado.boxes):
         if score < LIMIAR_SCORE_OCR or not texto.strip():
             continue
         xs = [float(p[0]) for p in poly]
         ys = [float(p[1]) for p in poly]
         blocos.append({"texto": texto, "x0": min(xs), "y0": min(ys), "x1": max(xs), "y1": max(ys)})
+
+    # Achado testando fonte cursiva sobre foto (titulo do catalogo real):
+    # o RapidOCR as vezes devolve uma caixa desproporcionalmente alta pra
+    # um bloco — capturando o espaco vertical de 2 linhas mas so
+    # reconhecendo o texto da primeira. Isso apaga a segunda linha (que
+    # ninguem detectou, entao ninguem traduz) sem colocar nada no lugar —
+    # sai pior que nao mexer. Descarta blocos com altura muito fora do
+    # padrao da pagina (mais seguro deixar o texto original intocado do
+    # que arriscar corromper).
+    if len(blocos) >= 3:
+        alturas = sorted(b["y1"] - b["y0"] for b in blocos)
+        mediana = alturas[len(alturas) // 2]
+        blocos = [b for b in blocos if (b["y1"] - b["y0"]) <= mediana * 1.8]
+
     return blocos
 
 

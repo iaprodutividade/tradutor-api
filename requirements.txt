@@ -14,6 +14,12 @@ httpx>=0.27
 # exatamente 9.5.0 em todas as versoes ate a 1.6.0 (a mais recente).
 Pillow==9.5.0
 numpy>=1.26
-paddlepaddle>=3.0
-paddleocr>=3.0
+# paddleocr/paddlepaddle removidos: o motor nativo do PaddlePaddle trava
+# com SIGSEGV/SIGABRT em ARM64 dentro de Docker (bug conhecido, ainda sem
+# solucao da equipe do PaddlePaddle, confirmado em varios relatos
+# independentes no GitHub). rapidocr usa os MESMOS modelos PP-OCR, mas via
+# ONNX Runtime em vez do motor nativo do Paddle -- mesma qualidade de
+# reconhecimento, sem o bug de arquitetura.
+rapidocr>=2.0
+onnxruntime>=1.18
 iopaint>=1.4
