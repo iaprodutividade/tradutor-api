@@ -610,7 +610,10 @@ def _normalizar_para_comparacao(texto: str) -> str:
 
 
 def detectar_elementos_repetidos(
-    doc: fitz.Document, indices: list[int], min_paginas: int = 2
+    doc: fitz.Document,
+    indices: list[int],
+    min_paginas: int = 2,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> tuple[dict[int, list[tuple[float, float, float, float]]], dict[int, list[dict]]]:
     """Detecta blocos de texto curtos (até 4 palavras, pelo menos 5
     caracteres) cujo texto se repete em pelo menos `min_paginas` páginas
@@ -644,11 +647,13 @@ def detectar_elementos_repetidos(
 
     candidatos = []  # (pagina, bloco, texto_normalizado)
     blocos_por_pagina: dict[int, list[dict]] = {}
-    for i in indices:
+    for idx_na_amostra, i in enumerate(indices):
         pix = doc[i].get_pixmap(dpi=DPI_RENDER_IMAGEM)
         imagem = Image.open(io.BytesIO(pix.tobytes("png")))
         blocos_pagina = _ocr_blocos_pagina(imagem)
         blocos_por_pagina[i] = blocos_pagina
+        if on_progress:
+            on_progress(idx_na_amostra + 1, len(indices))
         for b in blocos_pagina:
             if len(b["texto"].split()) > MAX_PALAVRAS_ELEMENTO_REPETIDO:
                 continue

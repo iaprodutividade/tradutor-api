@@ -218,18 +218,32 @@ def _calcular_preco_imagem(paginas: int) -> int:
 
 
 # Quantas páginas processar de verdade pra prévia do PDF-imagem antes de
-# cobrar — 5 páginas ou metade do documento, o que for menor (decisão do
-# Robson: pra documento curto, "5 primeiras" seria quase o documento
-# inteiro de graça). Mínimo de 2 quando o documento tem 2+ páginas: com
-# só 1 página na prévia, detectar_elementos_repetidos não tem o que
-# comparar entre páginas e a logo fica sem proteção — foi um bug real
-# visto num teste com documento de 2 páginas. Documento de exatamente 1
-# página segue sem proteção automática de logo (limitação conhecida, não
-# resolvida — precisaria de outro sinal, não cross-página).
+# cobrar — degressivo por tamanho do documento (decisão com o Robson em
+# 24/09/2026: a fórmula antiga dava até 50% do documento de graça pra
+# documentos pequenos/médios, caro demais pro processamento pesado de
+# OCR+inpaint+tradução). Piso de 2 páginas sempre que o documento tiver 2+
+# páginas: com só 1 página na amostra, detectar_elementos_repetidos não tem
+# o que comparar entre páginas e a prévia grátis fica sem a proteção
+# automática de logo — justamente o diferencial que a prévia deveria
+# mostrar. Documento de exatamente 1 página segue sem proteção automática
+# de logo (limitação conhecida, não resolvida — precisaria de outro sinal,
+# não cross-página).
+FAIXAS_PAGINAS_GRATIS_IMAGEM = [
+    (20, 2),
+    (30, 3),
+    (40, 4),
+    (50, 5),
+    (float("inf"), 5),
+]
+
+
 def _n_paginas_previa_imagem(total_paginas: int) -> int:
     if total_paginas <= 1:
         return 1
-    return max(2, min(5, total_paginas // 2 or 2))
+    for limite, n_gratis in FAIXAS_PAGINAS_GRATIS_IMAGEM:
+        if total_paginas <= limite:
+            return min(n_gratis, total_paginas)
+    return min(FAIXAS_PAGINAS_GRATIS_IMAGEM[-1][1], total_paginas)
 
 
 class GerarPreviaImagemBody(BaseModel):
@@ -286,12 +300,22 @@ def _processar_previa_imagem(job: dict):
             doc = fitz.open(origem)
             total_paginas = len(doc)
             indices = list(range(_n_paginas_previa_imagem(total_paginas)))
-            if len(indices) >= 2:
-                areas_protegidas, blocos_ocr_cache = detectar_elementos_repetidos(doc, indices)
+            # Progresso unificado nas duas fases (deteccao de logo + traducao
+            # em si) -- sem isso a barra fica muda/parada na fase de deteccao
+            # (que tambem faz OCR pagina a pagina, mesmo custo de tempo da
+            # traducao) e so aparece quando a segunda fase comeca, dando a
+            # falsa impressao de que nada esta acontecendo.
+            roda_deteccao = len(indices) >= 2
+            total_unificado = len(indices) * 2 if roda_deteccao else len(indices)
+            if roda_deteccao:
+                areas_protegidas, blocos_ocr_cache = detectar_elementos_repetidos(
+                    doc, indices, on_progress=lambda feitas, _total: progresso(feitas, total_unificado)
+                )
             else:
                 areas_protegidas, blocos_ocr_cache = {}, {}
             doc.close()
 
+            offset = len(indices) if roda_deteccao else 0
             paginas_sem_texto = process_pdf_imagem(
                 origem,
                 saida,
@@ -300,7 +324,7 @@ def _processar_previa_imagem(job: dict):
                 page_indices=indices,
                 areas_protegidas_por_pagina=areas_protegidas,
                 blocos_ocr_cache=blocos_ocr_cache,
-                on_progress=progresso,
+                on_progress=lambda feitas, _total: progresso(offset + feitas, total_unificado),
             )
 
             doc_previa = fitz.open(saida)
@@ -506,11 +530,19 @@ def _processar_job_completo(job: dict):
                 # melhor pra achar o que se repete de verdade.
                 doc = fitz.open(origem)
                 indices_completos = list(range(len(doc)))
-                if len(indices_completos) >= 2:
-                    areas_protegidas, blocos_ocr_cache = detectar_elementos_repetidos(doc, indices_completos)
+                # Mesmo progresso unificado (deteccao + traducao) da previa --
+                # ver _processar_previa_imagem pro motivo.
+                roda_deteccao = len(indices_completos) >= 2
+                total_unificado = len(indices_completos) * 2 if roda_deteccao else len(indices_completos)
+                if roda_deteccao:
+                    areas_protegidas, blocos_ocr_cache = detectar_elementos_repetidos(
+                        doc, indices_completos, on_progress=lambda feitas, _total: progresso(feitas, total_unificado)
+                    )
                 else:
                     areas_protegidas, blocos_ocr_cache = {}, {}
                 doc.close()
+
+                offset = len(indices_completos) if roda_deteccao else 0
 
                 # paginas_gratis_completo aqui é o dado verdadeiro (documento
                 # inteiro, não só a amostra da prévia) — sobrescreve a
@@ -523,7 +555,7 @@ def _processar_job_completo(job: dict):
                     job["idioma_destino"],
                     areas_protegidas_por_pagina=areas_protegidas,
                     blocos_ocr_cache=blocos_ocr_cache,
-                    on_progress=progresso,
+                    on_progress=lambda feitas, _total: progresso(offset + feitas, total_unificado),
                     on_uso=registrar_uso,
                 )
             elif sufixo == ".pdf":
