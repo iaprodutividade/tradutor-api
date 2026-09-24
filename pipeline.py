@@ -512,16 +512,31 @@ def _agrupar_em_linhas(blocos: list[dict]) -> list[dict]:
     return linhas
 
 
-def _agrupar_linhas_em_paragrafos(linhas: list[dict]) -> list[dict]:
+FRACAO_MAX_ALTURA_PARAGRAFO = 0.22
+
+
+def _agrupar_linhas_em_paragrafos(linhas: list[dict], altura_pagina_px: float | None = None) -> list[dict]:
     """Une linhas em parágrafos/colunas: precisa estar verticalmente perto
     E ter sobreposição horizontal real com a linha vizinha (mesma coluna)
     — evita fundir colunas lado a lado, que não se sobrepõem em x. Título
     normalmente sai isolado porque o espaço até o corpo do texto é maior
-    que o limiar."""
+    que o limiar.
+
+    altura_pagina_px, se informado, limita a altura de um parágrafo a
+    FRACAO_MAX_ALTURA_PARAGRAFO da página inteira -- sem isso, um cardápio
+    ou lista de preços com pouco espaço entre seções (ex: "Entrada" /
+    "Salgados" / "Jantar" um embaixo do outro, mesmo espaçamento de linha
+    dentro e entre as seções) funde o documento inteiro num parágrafo só.
+    Visto na prática: 37 blocos de OCR viraram 1 parágrafo cobrindo 87% da
+    imagem, e o LaMa (sem contexto de fundo sobrando pra copiar) devolveu a
+    área inteira em branco, apagando cor de fundo e logo do cardápio."""
     if not linhas:
         return []
     altura_media = sum(l["y1"] - l["y0"] for l in linhas) / len(linhas)
     gap_maximo_y = altura_media * 0.9
+    altura_maxima_paragrafo = (
+        altura_pagina_px * FRACAO_MAX_ALTURA_PARAGRAFO if altura_pagina_px else float("inf")
+    )
 
     grupos = [dict(l, linhas=[l["texto"]]) for l in linhas]
 
@@ -540,6 +555,9 @@ def _agrupar_linhas_em_paragrafos(linhas: list[dict]) -> list[dict]:
                     continue
                 largura_menor = min(a["x1"] - a["x0"], b["x1"] - b["x0"])
                 if _sobrepoe_1d(a["x0"], a["x1"], b["x0"], b["x1"]) < largura_menor * 0.3:
+                    continue
+                nova_altura = max(a["y1"], b["y1"]) - min(a["y0"], b["y0"])
+                if nova_altura > altura_maxima_paragrafo:
                     continue
                 a["linhas"] += b["linhas"]
                 a["x0"], a["y0"] = min(a["x0"], b["x0"]), min(a["y0"], b["y0"])
@@ -750,7 +768,7 @@ def process_pdf_imagem(
         # protegida do jeito que já era.
         linhas_todas = _agrupar_em_linhas(blocos)
         linhas = [l for l in linhas_todas if not all(_bloco_protegido(b, areas_protegidas) for b in l["itens"])]
-        paragrafos = _agrupar_linhas_em_paragrafos(linhas)
+        paragrafos = _agrupar_linhas_em_paragrafos(linhas, altura_pagina_px=imagem_original.height)
 
         # Grupo isolado (nunca se juntou a nenhuma linha vizinha) com texto
         # de 1-2 caracteres quase sempre é ruído do OCR lendo um pedaço de
