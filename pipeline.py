@@ -408,7 +408,17 @@ def _get_inpaint_model():
     global _inpaint_model_manager
     if _inpaint_model_manager is None:
         import torch
+        from iopaint.model import models as iopaint_models
         from iopaint.model_manager import ModelManager
+
+        # A CLI do iopaint (`iopaint run`) baixa o peso do modelo antes de
+        # instanciar o ModelManager — usando a API do jeito direto (sem
+        # passar pela CLI), esse passo não acontece sozinho e o
+        # ModelManager nem lista "lama" como disponível (só "cv2", que não
+        # precisa de download nenhum). Isso só baixa se ainda não tiver
+        # os arquivos em cache; idempotente.
+        if iopaint_models["lama"].is_erase_model:
+            iopaint_models["lama"].download()
 
         _inpaint_model_manager = ModelManager(name="lama", device=torch.device("cpu"))
     return _inpaint_model_manager
