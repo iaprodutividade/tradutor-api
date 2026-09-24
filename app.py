@@ -292,7 +292,7 @@ def _processar_previa_imagem(job: dict):
                 areas_protegidas, blocos_ocr_cache = {}, {}
             doc.close()
 
-            process_pdf_imagem(
+            paginas_sem_texto = process_pdf_imagem(
                 origem,
                 saida,
                 job["idioma_origem"],
@@ -312,12 +312,32 @@ def _processar_previa_imagem(job: dict):
                 caminhos.append(caminho)
             doc_previa.close()
 
+            # Renderiza também as páginas originais (sem tradução) na mesma
+            # resolução, pra o frontend mostrar lado a lado com a traduzida
+            # (zoom/comparação) — a prévia até aqui só guardava a traduzida.
+            doc_original_paginas = fitz.open(origem)
+            caminhos_originais = []
+            for idx_na_fila, i in enumerate(indices):
+                pix = doc_original_paginas[i].get_pixmap(dpi=150)
+                caminho = f"previas/{job_id}/original_{idx_na_fila}.png"
+                _subir_para_storage(caminho, pix.tobytes("png"), "image/png")
+                caminhos_originais.append(caminho)
+            doc_original_paginas.close()
+
+        # Páginas confirmadas sem texto cobrável dentro da amostra já
+        # processada não entram no preço — o resto do documento (fora da
+        # amostra) só é confirmado depois do pagamento, no processamento
+        # completo (ver _processar_job_completo).
+        paginas_cobradas = max(1, total_paginas - len(paginas_sem_texto))
+
         _atualizar_job(
             job_id,
             {
                 "status": "previa_imagem_pronta",
                 "previas_imagem_paths": caminhos,
-                "preco_centavos": _calcular_preco_imagem(total_paginas),
+                "previas_imagem_originais_paths": caminhos_originais,
+                "paginas_gratis_indices": paginas_sem_texto,
+                "preco_centavos": _calcular_preco_imagem(paginas_cobradas),
             },
         )
     except Exception as e:
@@ -475,6 +495,7 @@ def _processar_job_completo(job: dict):
             origem.write_bytes(conteudo)
             destino = Path(tmp) / f"traduzido{sufixo}"
 
+            paginas_gratis_completo: list[int] | None = None
             if job["tipo_arquivo"] == "pdf_sem_texto":
                 # Mesmo pipeline da prévia (OCR + inpaint + reescrita),
                 # mas sem o corte de páginas — page_indices=None processa
@@ -491,7 +512,11 @@ def _processar_job_completo(job: dict):
                     areas_protegidas, blocos_ocr_cache = {}, {}
                 doc.close()
 
-                process_pdf_imagem(
+                # paginas_gratis_completo aqui é o dado verdadeiro (documento
+                # inteiro, não só a amostra da prévia) — sobrescreve a
+                # estimativa salva no pagamento só pra registro/auditoria,
+                # não gera reembolso automático (já foi cobrado via Pix).
+                paginas_gratis_completo = process_pdf_imagem(
                     origem,
                     destino,
                     job["idioma_origem"],
@@ -530,10 +555,10 @@ def _processar_job_completo(job: dict):
         )
         _subir_para_storage(caminho_traduzido, traduzido_bytes, content_type)
         custo_centavos = custo_centavos_brl(uso_acumulado["prompt_tokens"], uso_acumulado["completion_tokens"])
-        _atualizar_job(
-            job_id,
-            {"status": "pronto", "arquivo_traduzido_path": caminho_traduzido, "custo_ia_centavos": custo_centavos},
-        )
+        campos_finais = {"status": "pronto", "arquivo_traduzido_path": caminho_traduzido, "custo_ia_centavos": custo_centavos}
+        if paginas_gratis_completo is not None:
+            campos_finais["paginas_gratis_indices"] = paginas_gratis_completo
+        _atualizar_job(job_id, campos_finais)
     except Exception as exc:
         custo_centavos = custo_centavos_brl(uso_acumulado["prompt_tokens"], uso_acumulado["completion_tokens"])
         _atualizar_job(

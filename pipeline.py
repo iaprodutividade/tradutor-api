@@ -595,6 +595,11 @@ MAX_PALAVRAS_ELEMENTO_REPETIDO = 4
 MIN_CARACTERES_ELEMENTO_REPETIDO = 5  # evita casar conectivo curto ("no", "da", "em")
 MARGEM_PROTECAO_PX = 20
 
+# Abaixo desse total de caracteres reconhecidos numa página inteira
+# (ex: só uma logo protegida, ou nada de OCR), não cobra a página — não é
+# justo cobrar o preço cheio de uma capa que não tinha nada pra traduzir.
+MIN_CARACTERES_PAGINA_COBRAVEL = 20
+
 
 def _normalizar_para_comparacao(texto: str) -> str:
     """Tira espaços e caixa — o OCR não é 100% consistente entre páginas
@@ -709,7 +714,12 @@ def process_pdf_imagem(
     blocos_ocr_cache: {indice_da_pagina: [bloco, ...]} — blocos de OCR já
     calculados por detectar_elementos_repetidos pras mesmas páginas.
     Quando presente pra uma página, pula o OCR dessa página aqui (o custo
-    mais alto do pipeline) em vez de rodar de novo."""
+    mais alto do pipeline) em vez de rodar de novo.
+
+    Devolve a lista de índices (0-based, absolutos no documento) das
+    páginas processadas que não tinham texto cobrável (ex: capa só com
+    desenho/foto, sem letra nenhuma pra traduzir) — usado por quem chama
+    pra não cobrar essas páginas no preço final."""
     doc_original = fitz.open(input_path)
     indices = page_indices if page_indices is not None else list(range(len(doc_original)))
     total_paginas = len(indices)
@@ -718,6 +728,7 @@ def process_pdf_imagem(
     doc_saida = fitz.open()
     escala = 72 / DPI_RENDER_IMAGEM
     blocos_ocr_cache = blocos_ocr_cache or {}
+    paginas_sem_texto_cobravel: list[int] = []
 
     for indice_na_fila, i in enumerate(indices):
         pix = doc_original[i].get_pixmap(dpi=DPI_RENDER_IMAGEM)
@@ -737,6 +748,13 @@ def process_pdf_imagem(
         # então filtrar por score não funciona. Descartar aqui evita
         # reinserir um caractere solto e sem sentido na imagem final.
         paragrafos = [p for p in paragrafos if len(p["texto"].strip()) > 2]
+
+        # Página sem texto cobrável: soma de caracteres reais abaixo do
+        # limiar (ex: só uma logo ou nada de OCR) — não é justo cobrar o
+        # preço cheio de uma página que não tinha nada pra traduzir.
+        caracteres_pagina = sum(len(p["texto"].strip()) for p in paragrafos)
+        if caracteres_pagina < MIN_CARACTERES_PAGINA_COBRAVEL:
+            paginas_sem_texto_cobravel.append(i)
 
         imagem_limpa = _limpar_fundo(imagem_original, paragrafos)
 
@@ -765,6 +783,7 @@ def process_pdf_imagem(
     doc_original.close()
     doc_saida.save(output_path)
     doc_saida.close()
+    return paginas_sem_texto_cobravel
 
 
 def process_pdf(
