@@ -29,7 +29,13 @@ RUN fc-cache -f
 # ARM64 sem GPU nenhuma (Oracle A1.Flex) -- a variante CUDA nunca roda o
 # codigo dela, so ocupa ~5GB de imagem a toa. Fixado na mesma versao que o
 # iopaint ja resolvia (2.14.0) pra nao conflitar com o requirement dele.
-RUN pip install --no-cache-dir torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu
+# torchvision junto e na MESMA variante +cpu -- sem isso o requirements.txt
+# instala um torchvision compilado pra parear com o torch "normal" (CUDA),
+# ABI incompativel com o torch+cpu de cima: quebra em runtime com "operator
+# torchvision::nms does not exist" ao importar diffusers/transformers
+# (visto na pratica logo apos essa mudanca -- nunca subir essa troca sem
+# testar um documento real de PDF-imagem antes).
+RUN pip install --no-cache-dir torch==2.14.0 torchvision==0.29.0 --index-url https://download.pytorch.org/whl/cpu
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
