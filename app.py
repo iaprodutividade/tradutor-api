@@ -127,8 +127,8 @@ async def preview(
     _checar_rate_limit(_ip_do_cliente(request))
 
     sufixo = Path(arquivo.filename or "").suffix.lower()
-    if sufixo not in (".pdf", ".docx"):
-        raise HTTPException(status_code=400, detail="Só aceitamos .pdf ou .docx")
+    if sufixo not in (".pdf", ".docx", ".jpg", ".jpeg", ".png", ".webp"):
+        raise HTTPException(status_code=400, detail="Só aceitamos .pdf, .docx, .jpg, .jpeg, .png ou .webp")
 
     conteudo = await arquivo.read()
     if len(conteudo) > MAX_TAMANHO_ARQUIVO:
@@ -138,9 +138,13 @@ async def preview(
         origem = Path(tmp) / f"origem{sufixo}"
         origem.write_bytes(conteudo)
 
-        if sufixo == ".pdf":
-            return _preview_pdf(origem, Path(tmp), idioma_origem, idioma_destino)
-        return _preview_docx(origem, Path(tmp), idioma_origem, idioma_destino)
+        if sufixo == ".docx":
+            return _preview_docx(origem, Path(tmp), idioma_origem, idioma_destino)
+        # PDF e imagem (jpg/png/webp) passam pelo mesmo caminho -- o fitz
+        # abre uma imagem crua como um "documento" de 1 página sem texto
+        # extraível, então _preview_pdf já detecta eh_imagem=True sozinho e
+        # cai no mesmo fluxo de PDF-imagem, sem precisar converter nada.
+        return _preview_pdf(origem, Path(tmp), idioma_origem, idioma_destino)
 
 
 def _preview_pdf(origem: Path, tmp: Path, idioma_origem: str, idioma_destino: str):
@@ -293,7 +297,12 @@ def _processar_previa_imagem(job: dict):
         conteudo = _baixar_do_storage(job["arquivo_original_path"])
 
         with tempfile.TemporaryDirectory() as tmp:
-            origem = Path(tmp) / "origem.pdf"
+            # Extensão real do arquivo (pode ser .jpg/.png/.webp, não só
+            # .pdf) -- o fitz abre imagem crua como documento de 1 página
+            # sozinho, mas precisa do arquivo salvo com a extensão certa
+            # pra reconhecer o formato.
+            sufixo_original = Path(job["arquivo_original_path"]).suffix.lower()
+            origem = Path(tmp) / f"origem{sufixo_original}"
             origem.write_bytes(conteudo)
             saida = Path(tmp) / "previa.pdf"
 
@@ -451,9 +460,15 @@ def _baixar_do_storage(path: str) -> bytes:
 
 
 def _subir_para_storage(path: str, conteudo: bytes, content_type: str):
+    # x-upsert: sem isso, o Storage responde 400 se já existir um objeto
+    # nesse caminho -- acontece de verdade quando o mesmo job é reprocessado
+    # (webhook do Mercado Pago pode reenviar a notificação, e mesmo com a
+    # checagem de idempotência em /traduzir-completo, um reprocessamento
+    # legítimo do mesmo job_id deve poder sobrescrever o resultado anterior,
+    # não falhar).
     resp = httpx.post(
         f"{SUPABASE_URL}/storage/v1/object/{BUCKET_ARQUIVOS}/{path}",
-        headers=_supabase_headers(content_type),
+        headers={**_supabase_headers(content_type), "x-upsert": "true"},
         content=conteudo,
         timeout=120,
     )
@@ -489,6 +504,11 @@ async def traduzir_completo(
 def _processar_job_completo(job: dict):
     job_id = job["id"]
     sufixo = Path(job["arquivo_original_path"]).suffix.lower()
+    # Extensão do arquivo de SAÍDA -- não é sempre igual à de entrada: um
+    # pdf_sem_texto pode ter vindo de uma imagem crua (.jpg/.png/.webp), mas
+    # o resultado processado é sempre um PDF de verdade (montado do zero via
+    # fitz em process_pdf_imagem), nunca a imagem original.
+    sufixo_saida = ".docx" if job["tipo_arquivo"] == "docx" else ".pdf"
 
     # Atualiza o progresso no Supabase pra a tela de pagamento mostrar uma
     # barra de verdade — unidades_total so e conhecido quando o processamento
@@ -517,7 +537,7 @@ def _processar_job_completo(job: dict):
         with tempfile.TemporaryDirectory() as tmp:
             origem = Path(tmp) / f"origem{sufixo}"
             origem.write_bytes(conteudo)
-            destino = Path(tmp) / f"traduzido{sufixo}"
+            destino = Path(tmp) / f"traduzido{sufixo_saida}"
 
             paginas_gratis_completo: list[int] | None = None
             if job["tipo_arquivo"] == "pdf_sem_texto":
@@ -579,10 +599,10 @@ def _processar_job_completo(job: dict):
 
             traduzido_bytes = destino.read_bytes()
 
-        caminho_traduzido = f"traduzidos/{job_id}{sufixo}"
+        caminho_traduzido = f"traduzidos/{job_id}{sufixo_saida}"
         content_type = (
             "application/pdf"
-            if sufixo == ".pdf"
+            if sufixo_saida == ".pdf"
             else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         )
         _subir_para_storage(caminho_traduzido, traduzido_bytes, content_type)
