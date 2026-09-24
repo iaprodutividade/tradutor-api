@@ -189,14 +189,32 @@ def _preview_pdf(origem: Path, tmp: Path, idioma_origem: str, idioma_destino: st
     }
 
 
-# Preço especial do PDF-imagem: mais caro que o preço normal por página
-# (o processamento é bem mais trabalhoso — OCR + limpeza de imagem +
-# reescrita). Mínimo igual ao fluxo normal (PRECO_MINIMO_CENTAVOS).
-PRECO_POR_PAGINA_IMAGEM_CENTAVOS = 1000  # R$10/página
+# Faixas de preço do PDF-imagem — mesmo padrão de FAIXAS_PRECO (documento
+# inteiro numa faixa só, sem degrau brusco), mas com piso mais caro e mais
+# alto que o texto em qualquer volume: o processamento é mais pesado (OCR +
+# inpaint + reescrita, praticamente sequencial por página numa VPS de CPU
+# limitada) e é um diferencial sem alternativa no mercado, então não faz
+# sentido correr pro mesmo piso do texto (R$3,00) só porque o documento é
+# grande. Decisão de 24/09/2026 com o Robson, depois de discutir a
+# economia unitária.
+FAIXAS_PRECO_IMAGEM = [
+    (15, 1000),  # até 15 páginas: R$10,00/página
+    (50, 800),  # 16-50: R$8,00/página (20% off)
+    (100, 600),  # 51-100: R$6,00/página (40% off)
+    (float("inf"), 500),  # 100+: R$5,00/página (50% off)
+]
+
+
+def _preco_por_pagina_imagem_centavos(paginas: int) -> int:
+    for limite, preco in FAIXAS_PRECO_IMAGEM:
+        if paginas <= limite:
+            return preco
+    return FAIXAS_PRECO_IMAGEM[-1][1]
 
 
 def _calcular_preco_imagem(paginas: int) -> int:
-    return max(PRECO_MINIMO_CENTAVOS, paginas * PRECO_POR_PAGINA_IMAGEM_CENTAVOS)
+    preco_pagina = _preco_por_pagina_imagem_centavos(paginas)
+    return max(PRECO_MINIMO_CENTAVOS, paginas * preco_pagina)
 
 
 # Quantas páginas processar de verdade pra prévia do PDF-imagem antes de
@@ -268,7 +286,10 @@ def _processar_previa_imagem(job: dict):
             doc = fitz.open(origem)
             total_paginas = len(doc)
             indices = list(range(_n_paginas_previa_imagem(total_paginas)))
-            areas_protegidas = detectar_elementos_repetidos(doc, indices) if len(indices) >= 2 else {}
+            if len(indices) >= 2:
+                areas_protegidas, blocos_ocr_cache = detectar_elementos_repetidos(doc, indices)
+            else:
+                areas_protegidas, blocos_ocr_cache = {}, {}
             doc.close()
 
             process_pdf_imagem(
@@ -278,6 +299,7 @@ def _processar_previa_imagem(job: dict):
                 job["idioma_destino"],
                 page_indices=indices,
                 areas_protegidas_por_pagina=areas_protegidas,
+                blocos_ocr_cache=blocos_ocr_cache,
                 on_progress=progresso,
             )
 
@@ -453,7 +475,33 @@ def _processar_job_completo(job: dict):
             origem.write_bytes(conteudo)
             destino = Path(tmp) / f"traduzido{sufixo}"
 
-            if sufixo == ".pdf":
+            if job["tipo_arquivo"] == "pdf_sem_texto":
+                # Mesmo pipeline da prévia (OCR + inpaint + reescrita),
+                # mas sem o corte de páginas — page_indices=None processa
+                # o documento inteiro. A detecção de logo roda nas páginas
+                # todas agora (não só nas poucas da prévia): documento
+                # grande pode ter template de página diferente que só
+                # aparece depois da 5ª página, e mais páginas = amostra
+                # melhor pra achar o que se repete de verdade.
+                doc = fitz.open(origem)
+                indices_completos = list(range(len(doc)))
+                if len(indices_completos) >= 2:
+                    areas_protegidas, blocos_ocr_cache = detectar_elementos_repetidos(doc, indices_completos)
+                else:
+                    areas_protegidas, blocos_ocr_cache = {}, {}
+                doc.close()
+
+                process_pdf_imagem(
+                    origem,
+                    destino,
+                    job["idioma_origem"],
+                    job["idioma_destino"],
+                    areas_protegidas_por_pagina=areas_protegidas,
+                    blocos_ocr_cache=blocos_ocr_cache,
+                    on_progress=progresso,
+                    on_uso=registrar_uso,
+                )
+            elif sufixo == ".pdf":
                 process_pdf(
                     origem,
                     destino,

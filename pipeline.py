@@ -606,7 +606,7 @@ def _normalizar_para_comparacao(texto: str) -> str:
 
 def detectar_elementos_repetidos(
     doc: fitz.Document, indices: list[int], min_paginas: int = 2
-) -> dict[int, list[tuple[float, float, float, float]]]:
+) -> tuple[dict[int, list[tuple[float, float, float, float]]], dict[int, list[dict]]]:
     """Detecta blocos de texto curtos (até 4 palavras, pelo menos 5
     caracteres) cujo texto se repete em pelo menos `min_paginas` páginas
     diferentes — sinal forte de logo/marca/rodapé repetido, não conteúdo
@@ -627,17 +627,24 @@ def detectar_elementos_repetidos(
     devolve vazio (documento de 1 página processado sozinho não tem
     proteção automática de logo ainda; limitação conhecida).
 
-    Roda OCR uma vez a mais só pra essa detecção — process_pdf_imagem roda
-    OCR de novo por página depois. Duplicidade aceitável por ora; dá pra
-    otimizar reaproveitando esse resultado numa próxima iteração."""
+    Devolve também os blocos de OCR crus de cada página já processada
+    aqui (blocos_por_pagina), pra quem chamar poder repassar pra
+    process_pdf_imagem e evitar rodar o OCR de novo nas mesmas páginas —
+    antes essa duplicidade era aceita como custo conhecido; com documentos
+    grandes (a detecção roda nas páginas todas do PDF-imagem completo, não
+    só numas poucas da prévia) o OCR em dobro passa a ser tempo de verdade
+    numa VPS de CPU limitada, então vale reaproveitar."""
     if len(indices) < min_paginas:
-        return {}
+        return {}, {}
 
     candidatos = []  # (pagina, bloco, texto_normalizado)
+    blocos_por_pagina: dict[int, list[dict]] = {}
     for i in indices:
         pix = doc[i].get_pixmap(dpi=DPI_RENDER_IMAGEM)
         imagem = Image.open(io.BytesIO(pix.tobytes("png")))
-        for b in _ocr_blocos_pagina(imagem):
+        blocos_pagina = _ocr_blocos_pagina(imagem)
+        blocos_por_pagina[i] = blocos_pagina
+        for b in blocos_pagina:
             if len(b["texto"].split()) > MAX_PALAVRAS_ELEMENTO_REPETIDO:
                 continue
             normalizado = _normalizar_para_comparacao(b["texto"])
@@ -672,7 +679,7 @@ def detectar_elementos_repetidos(
                         bloco["y1"] + MARGEM_PROTECAO_PX,
                     )
                 )
-    return areas_por_pagina
+    return areas_por_pagina, blocos_por_pagina
 
 
 def process_pdf_imagem(
@@ -682,6 +689,7 @@ def process_pdf_imagem(
     target_lang: str,
     page_indices: list[int] | None = None,
     areas_protegidas_por_pagina: dict[int, list[tuple[float, float, float, float]]] | None = None,
+    blocos_ocr_cache: dict[int, list[dict]] | None = None,
     on_progress: Callable[[int, int], None] | None = None,
     on_uso: Callable[[dict], None] | None = None,
 ):
@@ -696,7 +704,12 @@ def process_pdf_imagem(
     areas_protegidas_por_pagina: {indice_da_pagina: [(x0,y0,x1,y1), ...]}
     em pixels, na resolução DPI_RENDER_IMAGEM — regiões (tipicamente logo/
     marca) que não entram na limpeza nem na tradução. Ainda não é detectado
-    automaticamente; quem chama precisa informar."""
+    automaticamente; quem chama precisa informar.
+
+    blocos_ocr_cache: {indice_da_pagina: [bloco, ...]} — blocos de OCR já
+    calculados por detectar_elementos_repetidos pras mesmas páginas.
+    Quando presente pra uma página, pula o OCR dessa página aqui (o custo
+    mais alto do pipeline) em vez de rodar de novo."""
     doc_original = fitz.open(input_path)
     indices = page_indices if page_indices is not None else list(range(len(doc_original)))
     total_paginas = len(indices)
@@ -704,12 +717,13 @@ def process_pdf_imagem(
 
     doc_saida = fitz.open()
     escala = 72 / DPI_RENDER_IMAGEM
+    blocos_ocr_cache = blocos_ocr_cache or {}
 
     for indice_na_fila, i in enumerate(indices):
         pix = doc_original[i].get_pixmap(dpi=DPI_RENDER_IMAGEM)
         imagem_original = Image.open(io.BytesIO(pix.tobytes("png")))
 
-        blocos = _ocr_blocos_pagina(imagem_original)
+        blocos = blocos_ocr_cache[i] if i in blocos_ocr_cache else _ocr_blocos_pagina(imagem_original)
         areas_protegidas = areas_protegidas_por_pagina.get(i, [])
         blocos_visiveis = [b for b in blocos if not _bloco_protegido(b, areas_protegidas)]
 
