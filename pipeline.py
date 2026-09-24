@@ -736,9 +736,15 @@ def process_pdf_imagem(
 
         blocos = blocos_ocr_cache[i] if i in blocos_ocr_cache else _ocr_blocos_pagina(imagem_original)
         areas_protegidas = areas_protegidas_por_pagina.get(i, [])
-        blocos_visiveis = [b for b in blocos if not _bloco_protegido(b, areas_protegidas)]
 
-        linhas = _agrupar_em_linhas(blocos_visiveis)
+        # Protege a LINHA inteira, não o bloco isolado — um nome de empresa
+        # que se repete tanto na logo quanto dentro de uma frase normal
+        # ("A Rosaves é uma empresa...") batia como "elemento repetido" e
+        # sumia só a palavra, quebrando a frase. Já uma linha onde TODOS os
+        # blocos são repetidos (a logo de verdade, sozinha) continua
+        # protegida do jeito que já era.
+        linhas_todas = _agrupar_em_linhas(blocos)
+        linhas = [l for l in linhas_todas if not all(_bloco_protegido(b, areas_protegidas) for b in l["itens"])]
         paragrafos = _agrupar_linhas_em_paragrafos(linhas)
 
         # Grupo isolado (nunca se juntou a nenhuma linha vizinha) com texto
