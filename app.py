@@ -23,9 +23,11 @@ from pipeline import (
     _aplicar_traducao_em_paragrafos,
     analisar_texto_extraivel,
     custo_centavos_brl,
+    detectar_elementos_repetidos,
     gerar_imagem_previa_docx,
     process_docx,
     process_pdf,
+    process_pdf_imagem,
     translate_batch,
 )
 
@@ -184,6 +186,88 @@ def _preview_pdf(origem: Path, tmp: Path, idioma_origem: str, idioma_destino: st
         "imagem_original_base64": imagem_original_b64,
         "imagem_traduzida_base64": imagem_traduzida_b64,
         "pdf_traduzido_base64": pdf_traduzido_b64,
+    }
+
+
+# Preço especial do PDF-imagem: mais caro que o preço normal por página
+# (o processamento é bem mais trabalhoso — OCR + limpeza de imagem +
+# reescrita). Mínimo igual ao fluxo normal (PRECO_MINIMO_CENTAVOS).
+PRECO_POR_PAGINA_IMAGEM_CENTAVOS = 1000  # R$10/página
+
+
+def _calcular_preco_imagem(paginas: int) -> int:
+    return max(PRECO_MINIMO_CENTAVOS, paginas * PRECO_POR_PAGINA_IMAGEM_CENTAVOS)
+
+
+# Quantas páginas processar de verdade pra prévia do PDF-imagem antes de
+# cobrar — 5 páginas ou metade do documento, o que for menor (decisão do
+# Robson: pra documento curto, "5 primeiras" seria quase o documento
+# inteiro de graça). Mínimo de 2 quando o documento tem 2+ páginas: com
+# só 1 página na prévia, detectar_elementos_repetidos não tem o que
+# comparar entre páginas e a logo fica sem proteção — foi um bug real
+# visto num teste com documento de 2 páginas. Documento de exatamente 1
+# página segue sem proteção automática de logo (limitação conhecida, não
+# resolvida — precisaria de outro sinal, não cross-página).
+def _n_paginas_previa_imagem(total_paginas: int) -> int:
+    if total_paginas <= 1:
+        return 1
+    return max(2, min(5, total_paginas // 2 or 2))
+
+
+@app.post("/preview-imagem")
+async def preview_imagem(
+    request: Request,
+    arquivo: UploadFile = File(...),
+    idioma_origem: str = Form(...),
+    idioma_destino: str = Form(...),
+    x_api_key: str | None = Header(default=None),
+):
+    """Processa de verdade as primeiras páginas de um PDF-imagem (sem
+    texto extraível) — chamado pelo frontend depois que /preview já
+    identificou o arquivo como tipo "pdf_sem_texto". Mais lento que o
+    /preview normal (roda OCR + LaMa + tradução de verdade), por isso é
+    uma rota separada, só acionada quando o visitante confirma que quer
+    seguir com o processamento especial."""
+    _checar_api_key(x_api_key)
+    _checar_rate_limit(_ip_do_cliente(request))
+
+    conteudo = await arquivo.read()
+    if len(conteudo) > MAX_TAMANHO_ARQUIVO:
+        raise HTTPException(status_code=413, detail="Arquivo muito grande (limite de 15 MB).")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        origem = Path(tmp) / "origem.pdf"
+        origem.write_bytes(conteudo)
+        saida = Path(tmp) / "previa.pdf"
+
+        doc = fitz.open(origem)
+        total_paginas = len(doc)
+        indices = list(range(_n_paginas_previa_imagem(total_paginas)))
+        areas_protegidas = detectar_elementos_repetidos(doc, indices) if len(indices) >= 2 else {}
+        doc.close()
+
+        process_pdf_imagem(
+            origem,
+            saida,
+            idioma_origem,
+            idioma_destino,
+            page_indices=indices,
+            areas_protegidas_por_pagina=areas_protegidas,
+        )
+
+        doc_previa = fitz.open(saida)
+        imagens_previa_b64 = []
+        for page in doc_previa:
+            pix = page.get_pixmap(dpi=150)
+            imagens_previa_b64.append(base64.b64encode(pix.tobytes("png")).decode())
+        doc_previa.close()
+
+    return {
+        "tipo": "pdf_imagem_processado",
+        "paginas_total": total_paginas,
+        "paginas_previa": len(indices),
+        "preco_centavos": _calcular_preco_imagem(total_paginas),
+        "imagens_previa_base64": imagens_previa_b64,
     }
 
 

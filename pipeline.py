@@ -10,6 +10,7 @@ mantendo a formatacao nativa do Word.
 """
 import base64
 import html
+import io
 import json
 import os
 import subprocess
@@ -21,6 +22,7 @@ import fitz  # pymupdf
 from docx import Document
 from dotenv import load_dotenv
 from openai import OpenAI
+from PIL import Image
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -358,6 +360,373 @@ def analisar_texto_extraivel(doc: fitz.Document, max_paginas_checar: int = 5) ->
         "paginas_com_texto": paginas_com_texto,
         "eh_imagem": razao < RAZAO_MINIMA_PAGINAS_COM_TEXTO,
     }
+
+
+# ---------------------------------------------------------------------------
+# PDF-imagem (sem texto extraível) — OCR + inpainting + reaproveita o
+# insert_htmlbox de process_pdf pra escrever o texto traduzido de volta.
+#
+# Validado contra um catálogo real (23 páginas, cliente Djarbas/Rosaves) que
+# nenhuma ferramenta do mercado conseguia traduzir — ver
+# claude-sessions-log/sessions/2026-09-23_tradutor-pdf-imagem-*.md pro
+# histórico completo dos testes que levaram a essa arquitetura.
+#
+# Limitação conhecida, ainda não resolvida: a proteção de logo/marca
+# (`areas_protegidas`) precisa ser informada manualmente por página — não
+# existe detecção automática de "isto é uma logo" ainda. Sem proteção,
+# texto de marca perto de um ícone gráfico pode sair corrompido pelo
+# inpainting (foi exatamente o bug encontrado e corrigido nos testes).
+# ---------------------------------------------------------------------------
+
+DPI_RENDER_IMAGEM = 150
+LIMIAR_SCORE_OCR = 0.5
+MARGEM_MASCARA_PX = 5
+
+_ocr_engine = None
+_inpaint_model_manager = None
+
+
+def _get_ocr_engine():
+    global _ocr_engine
+    if _ocr_engine is None:
+        from paddleocr import PaddleOCR
+
+        # enable_mkldnn=False evita um crash conhecido (NotImplementedError
+        # do oneDNN) na build CPU do PaddlePaddle pra Windows — não
+        # confirmado se é necessário no Linux da VPS; controlável por env
+        # var pra testar os dois casos sem mudar código.
+        habilitar_mkldnn = os.environ.get("PADDLEOCR_ENABLE_MKLDNN", "true").lower() != "false"
+        _ocr_engine = PaddleOCR(
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            lang="pt",
+            enable_mkldnn=habilitar_mkldnn,
+        )
+    return _ocr_engine
+
+
+def _get_inpaint_model():
+    global _inpaint_model_manager
+    if _inpaint_model_manager is None:
+        import torch
+        from iopaint.model_manager import ModelManager
+
+        _inpaint_model_manager = ModelManager(name="lama", device=torch.device("cpu"))
+    return _inpaint_model_manager
+
+
+def _ocr_blocos_pagina(imagem_pil) -> list[dict]:
+    """Roda o OCR numa imagem de página (PIL) e devolve os blocos de texto
+    com posição em pixels, descartando reconhecimentos de baixa confiança
+    (ruído de fundo decorativo, geralmente)."""
+    import numpy as np
+
+    ocr = _get_ocr_engine()
+    resultado = ocr.predict(np.array(imagem_pil.convert("RGB")))[0]
+    blocos = []
+    for texto, score, poly in zip(resultado["rec_texts"], resultado["rec_scores"], resultado["rec_polys"]):
+        if score < LIMIAR_SCORE_OCR or not texto.strip():
+            continue
+        xs = [float(p[0]) for p in poly]
+        ys = [float(p[1]) for p in poly]
+        blocos.append({"texto": texto, "x0": min(xs), "y0": min(ys), "x1": max(xs), "y1": max(ys)})
+    return blocos
+
+
+def _sobrepoe_1d(a0: float, a1: float, b0: float, b1: float) -> float:
+    return max(0.0, min(a1, b1) - max(a0, b0))
+
+
+def _gap_1d(a0: float, a1: float, b0: float, b1: float) -> float:
+    """Distância real entre dois intervalos 1D — 0 se sobrepõem, positiva
+    caso contrário, não importa qual dos dois vem primeiro no eixo. Um
+    gap_x = b.x0 - a.x1 simples dá errado (fica negativo, "parece perto")
+    quando o segundo bloco está à ESQUERDA do primeiro — foi um bug real
+    encontrado ao validar isso, misturava colunas vizinhas numa só."""
+    if a1 < b0:
+        return b0 - a1
+    if b1 < a0:
+        return a0 - b1
+    return 0.0
+
+
+def _agrupar_em_linhas(blocos: list[dict]) -> list[dict]:
+    """Funde fragmentos do OCR que estão na mesma faixa vertical E
+    fisicamente próximos no eixo x numa linha só, da esquerda pra direita.
+    Sem a checagem de x, duas colunas lado a lado na mesma altura viravam
+    uma 'linha' só, esticada pela página inteira (mesmo bug do parágrafo
+    acima, na direção horizontal)."""
+    if not blocos:
+        return []
+    ordenados = sorted(blocos, key=lambda b: (b["y0"], b["x0"]))
+    altura_media = sum(b["y1"] - b["y0"] for b in blocos) / len(blocos)
+    gap_maximo_x = altura_media * 1.2
+
+    linhas: list[dict] = []
+    for b in ordenados:
+        encaixou = False
+        for linha in linhas:
+            sobreposicao = _sobrepoe_1d(b["y0"], b["y1"], linha["y0"], linha["y1"])
+            menor_altura = min(b["y1"] - b["y0"], linha["y1"] - linha["y0"])
+            gap_x = _gap_1d(b["x0"], b["x1"], linha["x0"], linha["x1"])
+            if sobreposicao > menor_altura * 0.4 and gap_x < gap_maximo_x:
+                linha["itens"].append(b)
+                linha["x0"] = min(linha["x0"], b["x0"])
+                linha["y0"] = min(linha["y0"], b["y0"])
+                linha["x1"] = max(linha["x1"], b["x1"])
+                linha["y1"] = max(linha["y1"], b["y1"])
+                encaixou = True
+                break
+        if not encaixou:
+            linhas.append({"itens": [b], "x0": b["x0"], "y0": b["y0"], "x1": b["x1"], "y1": b["y1"]})
+
+    for linha in linhas:
+        linha["itens"].sort(key=lambda b: b["x0"])
+        linha["texto"] = " ".join(i["texto"] for i in linha["itens"])
+    linhas.sort(key=lambda l: l["y0"])
+    return linhas
+
+
+def _agrupar_linhas_em_paragrafos(linhas: list[dict]) -> list[dict]:
+    """Une linhas em parágrafos/colunas: precisa estar verticalmente perto
+    E ter sobreposição horizontal real com a linha vizinha (mesma coluna)
+    — evita fundir colunas lado a lado, que não se sobrepõem em x. Título
+    normalmente sai isolado porque o espaço até o corpo do texto é maior
+    que o limiar."""
+    if not linhas:
+        return []
+    altura_media = sum(l["y1"] - l["y0"] for l in linhas) / len(linhas)
+    gap_maximo_y = altura_media * 0.9
+
+    grupos = [dict(l, linhas=[l["texto"]]) for l in linhas]
+
+    mudou = True
+    while mudou:
+        mudou = False
+        grupos.sort(key=lambda g: g["y0"])
+        for i in range(len(grupos)):
+            if grupos[i] is None:
+                continue
+            for j in range(i + 1, len(grupos)):
+                if grupos[j] is None:
+                    continue
+                a, b = grupos[i], grupos[j]
+                if _gap_1d(a["y0"], a["y1"], b["y0"], b["y1"]) > gap_maximo_y:
+                    continue
+                largura_menor = min(a["x1"] - a["x0"], b["x1"] - b["x0"])
+                if _sobrepoe_1d(a["x0"], a["x1"], b["x0"], b["x1"]) < largura_menor * 0.3:
+                    continue
+                a["linhas"] += b["linhas"]
+                a["x0"], a["y0"] = min(a["x0"], b["x0"]), min(a["y0"], b["y0"])
+                a["x1"], a["y1"] = max(a["x1"], b["x1"]), max(a["y1"], b["y1"])
+                grupos[j] = None
+                mudou = True
+                break
+            if mudou:
+                break
+        grupos = [g for g in grupos if g is not None]
+
+    resultado = [
+        {"texto": " ".join(g["linhas"]), "x0": g["x0"], "y0": g["y0"], "x1": g["x1"], "y1": g["y1"]}
+        for g in grupos
+    ]
+    resultado.sort(key=lambda b: (b["y0"], b["x0"]))
+    return resultado
+
+
+def _bloco_protegido(bloco: dict, areas_protegidas: list[tuple[float, float, float, float]]) -> bool:
+    for x0, y0, x1, y1 in areas_protegidas:
+        if bloco["x0"] >= x0 and bloco["x1"] <= x1 and bloco["y0"] >= y0 and bloco["y1"] <= y1:
+            return True
+    return False
+
+
+def _limpar_fundo(imagem_pil, blocos_para_apagar: list[dict]):
+    """Roda o LaMa pra apagar/reconstruir o fundo sob os blocos de texto
+    (exceto os protegidos, já filtrados por quem chama). Devolve uma nova
+    imagem PIL."""
+    import numpy as np
+    from PIL import Image, ImageDraw
+    from iopaint.schema import InpaintRequest
+
+    if not blocos_para_apagar:
+        return imagem_pil
+
+    mask = Image.new("L", imagem_pil.size, 0)
+    draw = ImageDraw.Draw(mask)
+    for b in blocos_para_apagar:
+        draw.rectangle(
+            [b["x0"] - MARGEM_MASCARA_PX, b["y0"] - MARGEM_MASCARA_PX, b["x1"] + MARGEM_MASCARA_PX, b["y1"] + MARGEM_MASCARA_PX],
+            fill=255,
+        )
+
+    modelo = _get_inpaint_model()
+    resultado_bgr = modelo(np.array(imagem_pil.convert("RGB")), np.array(mask), InpaintRequest())
+    resultado_rgb = resultado_bgr[:, :, ::-1]
+    return Image.fromarray(resultado_rgb)
+
+
+MAX_PALAVRAS_ELEMENTO_REPETIDO = 4
+MIN_CARACTERES_ELEMENTO_REPETIDO = 5  # evita casar conectivo curto ("no", "da", "em")
+MARGEM_PROTECAO_PX = 20
+
+
+def _normalizar_para_comparacao(texto: str) -> str:
+    """Tira espaços e caixa — o OCR não é 100% consistente entre páginas
+    com o mesmo elemento gráfico (ex.: leu 'O JEITINHO BEM CASEIRO' com
+    espaço numa página e 'OJEITINHO BEM CASEIRO' grudado noutra, mesma
+    logo). Comparar só o texto "compactado" resolve isso."""
+    return "".join(texto.lower().split())
+
+
+def detectar_elementos_repetidos(
+    doc: fitz.Document, indices: list[int], min_paginas: int = 2
+) -> dict[int, list[tuple[float, float, float, float]]]:
+    """Detecta blocos de texto curtos (até 4 palavras, pelo menos 5
+    caracteres) cujo texto se repete em pelo menos `min_paginas` páginas
+    diferentes — sinal forte de logo/marca/rodapé repetido, não conteúdo
+    específico da página. Usado pra proteger automaticamente esses blocos
+    da limpeza/tradução, sem precisar de coordenada manual por documento.
+
+    Compara só o TEXTO (normalizado, sem espaço), não a posição — a
+    primeira versão exigia posição parecida também, mas quebrou no teste
+    real: a mesma logo aparece bem maior/centralizada na capa e menor/mais
+    à esquerda numa página de conteúdo (templates de página diferentes no
+    mesmo documento), então a posição normalizada variava demais (~10-20%)
+    pra um limiar apertado funcionar. Risco aceito: um nome próprio
+    genuinamente repetido no corpo do texto (não só na logo) também fica
+    protegido — melhor deixar uma palavra sem traduzir do que corromper a
+    logo de novo (bug real já visto duas vezes nos testes).
+
+    Com menos de `min_paginas` páginas disponíveis não há como comparar —
+    devolve vazio (documento de 1 página processado sozinho não tem
+    proteção automática de logo ainda; limitação conhecida).
+
+    Roda OCR uma vez a mais só pra essa detecção — process_pdf_imagem roda
+    OCR de novo por página depois. Duplicidade aceitável por ora; dá pra
+    otimizar reaproveitando esse resultado numa próxima iteração."""
+    if len(indices) < min_paginas:
+        return {}
+
+    candidatos = []  # (pagina, bloco, texto_normalizado)
+    for i in indices:
+        pix = doc[i].get_pixmap(dpi=DPI_RENDER_IMAGEM)
+        imagem = Image.open(io.BytesIO(pix.tobytes("png")))
+        for b in _ocr_blocos_pagina(imagem):
+            if len(b["texto"].split()) > MAX_PALAVRAS_ELEMENTO_REPETIDO:
+                continue
+            normalizado = _normalizar_para_comparacao(b["texto"])
+            if len(normalizado) < MIN_CARACTERES_ELEMENTO_REPETIDO:
+                continue
+            candidatos.append((i, b, normalizado))
+
+    areas_por_pagina: dict[int, list[tuple[float, float, float, float]]] = {}
+    usados = set()
+    for idx_a in range(len(candidatos)):
+        if idx_a in usados:
+            continue
+        pag_a, bloco_a, texto_a = candidatos[idx_a]
+        grupo = [(pag_a, bloco_a)]
+        paginas_com_match = {pag_a}
+        for idx_b in range(idx_a + 1, len(candidatos)):
+            if idx_b in usados:
+                continue
+            pag_b, bloco_b, texto_b = candidatos[idx_b]
+            if pag_b == pag_a or texto_a != texto_b:
+                continue
+            grupo.append((pag_b, bloco_b))
+            paginas_com_match.add(pag_b)
+            usados.add(idx_b)
+        if len(paginas_com_match) >= min_paginas:
+            for pag, bloco in grupo:
+                areas_por_pagina.setdefault(pag, []).append(
+                    (
+                        bloco["x0"] - MARGEM_PROTECAO_PX,
+                        bloco["y0"] - MARGEM_PROTECAO_PX,
+                        bloco["x1"] + MARGEM_PROTECAO_PX,
+                        bloco["y1"] + MARGEM_PROTECAO_PX,
+                    )
+                )
+    return areas_por_pagina
+
+
+def process_pdf_imagem(
+    input_path: Path,
+    output_path: Path,
+    source_lang: str,
+    target_lang: str,
+    page_indices: list[int] | None = None,
+    areas_protegidas_por_pagina: dict[int, list[tuple[float, float, float, float]]] | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+    on_uso: Callable[[dict], None] | None = None,
+):
+    """Traduz um PDF sem texto extraível (imagem/foto achatada) mantendo o
+    layout: OCR pra ler o texto, LaMa pra limpar o fundo, e o mesmo
+    insert_htmlbox de process_pdf pra escrever a tradução de volta.
+
+    page_indices=None processa o documento inteiro; uma lista processa só
+    essas páginas (0-based) — mesmo padrão de process_pdf, útil pra prévia
+    de "N primeiras páginas".
+
+    areas_protegidas_por_pagina: {indice_da_pagina: [(x0,y0,x1,y1), ...]}
+    em pixels, na resolução DPI_RENDER_IMAGEM — regiões (tipicamente logo/
+    marca) que não entram na limpeza nem na tradução. Ainda não é detectado
+    automaticamente; quem chama precisa informar."""
+    doc_original = fitz.open(input_path)
+    indices = page_indices if page_indices is not None else list(range(len(doc_original)))
+    total_paginas = len(indices)
+    areas_protegidas_por_pagina = areas_protegidas_por_pagina or {}
+
+    doc_saida = fitz.open()
+    escala = 72 / DPI_RENDER_IMAGEM
+
+    for indice_na_fila, i in enumerate(indices):
+        pix = doc_original[i].get_pixmap(dpi=DPI_RENDER_IMAGEM)
+        imagem_original = Image.open(io.BytesIO(pix.tobytes("png")))
+
+        blocos = _ocr_blocos_pagina(imagem_original)
+        areas_protegidas = areas_protegidas_por_pagina.get(i, [])
+        blocos_visiveis = [b for b in blocos if not _bloco_protegido(b, areas_protegidas)]
+
+        linhas = _agrupar_em_linhas(blocos_visiveis)
+        paragrafos = _agrupar_linhas_em_paragrafos(linhas)
+
+        # Grupo isolado (nunca se juntou a nenhuma linha vizinha) com texto
+        # de 1-2 caracteres quase sempre é ruído do OCR lendo um pedaço de
+        # desenho decorativo como se fosse letra — visto na prática: "D" e
+        # "DS" com confiança >0.98, mesma confiança de palavras reais,
+        # então filtrar por score não funciona. Descartar aqui evita
+        # reinserir um caractere solto e sem sentido na imagem final.
+        paragrafos = [p for p in paragrafos if len(p["texto"].strip()) > 2]
+
+        imagem_limpa = _limpar_fundo(imagem_original, paragrafos)
+
+        largura_pt, altura_pt = imagem_limpa.width * escala, imagem_limpa.height * escala
+        page = doc_saida.new_page(width=largura_pt, height=altura_pt)
+
+        buffer_imagem = io.BytesIO()
+        imagem_limpa.save(buffer_imagem, format="PNG")
+        page.insert_image(page.rect, stream=buffer_imagem.getvalue())
+
+        if paragrafos:
+            traducoes = translate_batch([p["texto"] for p in paragrafos], source_lang, target_lang, on_uso=on_uso)
+            for paragrafo, traduzido in zip(paragrafos, traducoes):
+                altura_linha_px = (paragrafo["y1"] - paragrafo["y0"]) / max(1, paragrafo["texto"].count(" ") // 8 + 1)
+                tamanho_pt = max(8, min(60, altura_linha_px * 72 / DPI_RENDER_IMAGEM * 0.85))
+                rect = fitz.Rect(
+                    paragrafo["x0"] * escala, paragrafo["y0"] * escala,
+                    paragrafo["x1"] * escala, paragrafo["y1"] * escala,
+                )
+                css = f"* {{ font-family: Helvetica, Arial, sans-serif; font-size: {tamanho_pt:.1f}pt; color: #262626; }}"
+                page.insert_htmlbox(rect, html.escape(traduzido), css=css, scale_low=0)
+
+        if on_progress:
+            on_progress(indice_na_fila + 1, total_paginas)
+
+    doc_original.close()
+    doc_saida.save(output_path)
+    doc_saida.close()
 
 
 def process_pdf(
