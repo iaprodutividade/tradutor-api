@@ -998,7 +998,7 @@ def process_pdf_imagem(
             on_progress(indice_na_fila + 1, total_paginas)
 
     doc_original.close()
-    doc_saida.save(output_path)
+    doc_saida.save(output_path, garbage=4, deflate=True)
     doc_saida.close()
     return paginas_sem_texto_cobravel
 
@@ -1295,7 +1295,10 @@ def process_pdf(
         if on_progress:
             on_progress(indice_na_fila, total_paginas_a_processar)
 
-    doc.save(output_path)
+    # garbage=4+deflate: reduz bastante o tamanho final sem perder nada
+    # (limpeza de objeto orfao + compressao de stream) -- ex. real: um
+    # PDF de 9 paginas de 0,4MB saia como 7,3MB sem isso.
+    doc.save(output_path, garbage=4, deflate=True)
     doc.close()
 
 
