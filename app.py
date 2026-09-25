@@ -28,6 +28,7 @@ from pipeline import (
     process_docx,
     process_pdf,
     process_pdf_imagem,
+    process_pdf_misto,
     translate_batch,
 )
 
@@ -168,7 +169,7 @@ def _preview_pdf(origem: Path, tmp: Path, idioma_origem: str, idioma_destino: st
         }
 
     traduzido = tmp / "traduzido.pdf"
-    process_pdf(origem, traduzido, idioma_origem, idioma_destino, page_indices=[0])
+    process_pdf_misto(origem, traduzido, idioma_origem, idioma_destino, page_indices=[0])
 
     doc_traduzido = fitz.open(traduzido)
     pix_traduzido = doc_traduzido[0].get_pixmap(dpi=200)
@@ -633,7 +634,12 @@ def _processar_job_completo(job: dict):
                     on_uso=registrar_uso,
                 )
             elif sufixo == ".pdf":
-                process_pdf(
+                # process_pdf_misto detecta sozinho página-imagem isolada
+                # (ex: capa 100% gráfica) dentro de um PDF majoritariamente
+                # de texto e roda OCR+inpaint só nelas — sem isso, essa
+                # página ficava intocada no idioma original (achado real
+                # com o arquivo "Gato Mia", ver claude-sessions-log).
+                process_pdf_misto(
                     origem,
                     destino,
                     job["idioma_origem"],

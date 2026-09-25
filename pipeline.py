@@ -1150,6 +1150,100 @@ def process_pdf(
     doc.close()
 
 
+def paginas_sem_texto_extraivel(doc: fitz.Document, indices: list[int] | None = None) -> list[int]:
+    """Varre TODAS as páginas pedidas (não só uma amostra) e devolve as que
+    não têm texto extraível de verdade — ao contrário de
+    analisar_texto_extraivel, que amostra só as primeiras páginas pra uma
+    decisão binária do documento inteiro. Usado pra achar página-imagem
+    isolada (ex: capa 100% gráfica) dentro de um documento majoritariamente
+    de texto, caso que a classificação binária não pega."""
+    alvo = indices if indices is not None else list(range(len(doc)))
+    return [i for i in alvo if len(doc[i].get_text("text").strip()) < CARACTERES_MINIMOS_TEXTO_PAGINA]
+
+
+def process_pdf_misto(
+    input_path: Path,
+    output_path: Path,
+    source_lang: str,
+    target_lang: str,
+    page_indices: list[int] | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+    on_uso: Callable[[dict], None] | None = None,
+) -> list[int]:
+    """Processa um PDF que pode ter página-imagem isolada (sem texto
+    extraível) dentro de um documento majoritariamente de texto — caso real
+    "capa 100% gráfica, resto com texto real" que analisar_texto_extraivel
+    não pega, porque só amostra pra classificar o documento inteiro como um
+    todo (ver claude-sessions-log/sessions/2026-09-24_tradutor-pagamento-
+    corrigido-upload-storage-e-classificador-marca.md).
+
+    Detecta, página a página, quais páginas do recorte pedido não têm texto
+    extraível e roda o pipeline de OCR+inpaint (process_pdf_imagem) só
+    nelas; o resto segue no pipeline de texto normal (process_pdf). Depois
+    remonta tudo num único PDF, respeitando a ordem original das páginas.
+
+    page_indices=None processa o documento inteiro; uma lista restringe —
+    mesmo padrão de process_pdf/process_pdf_imagem (usado pra prévia da 1ª
+    página).
+
+    Devolve a lista de índices (0-based, absolutos no documento) das
+    páginas-imagem tratadas dessa forma — só informativo/log; essas páginas
+    continuam entrando na contagem/preço normal do documento de texto (não
+    usa a tabela de preço do PDF-imagem, que é só pro documento inteiro sem
+    texto)."""
+    doc = fitz.open(input_path)
+    indices_alvo = page_indices if page_indices is not None else list(range(len(doc)))
+    indices_sem_texto = paginas_sem_texto_extraivel(doc, indices_alvo)
+    indices_com_texto = [i for i in indices_alvo if i not in indices_sem_texto]
+    doc.close()
+
+    if not indices_sem_texto:
+        process_pdf(input_path, output_path, source_lang, target_lang, page_indices=page_indices, on_progress=on_progress, on_uso=on_uso)
+        return []
+
+    total = len(indices_alvo)
+
+    def progresso_texto(feitas: int, _total_parcial: int):
+        if on_progress:
+            on_progress(feitas, total)
+
+    def progresso_imagem(feitas: int, _total_parcial: int):
+        if on_progress:
+            on_progress(len(indices_com_texto) + feitas, total)
+
+    texto_tmp = output_path.with_name(output_path.stem + "_texto_tmp.pdf")
+    imagem_tmp = output_path.with_name(output_path.stem + "_imagem_tmp.pdf")
+
+    # page_indices=indices_com_texto pode vir vazio (ex: prévia da 1ª página
+    # quando ela mesma é a página sem texto) — process_pdf ainda salva o
+    # documento inteiro nesse caso, só sem modificar nenhuma página, o que
+    # serve de base correta pra substituição abaixo.
+    process_pdf(
+        input_path, texto_tmp, source_lang, target_lang,
+        page_indices=indices_com_texto, on_progress=progresso_texto, on_uso=on_uso,
+    )
+    process_pdf_imagem(
+        input_path, imagem_tmp, source_lang, target_lang,
+        page_indices=indices_sem_texto, on_progress=progresso_imagem, on_uso=on_uso,
+    )
+
+    doc_principal = fitz.open(texto_tmp)
+    doc_substituto = fitz.open(imagem_tmp)
+    for idx_na_fila, i in enumerate(sorted(indices_sem_texto)):
+        doc_principal.delete_page(i)
+        doc_principal.insert_pdf(doc_substituto, from_page=idx_na_fila, to_page=idx_na_fila, start_at=i)
+    doc_substituto.close()
+    # garbage=4+deflate: sem isso, delete_page/insert_pdf deixa objeto
+    # orfao no arquivo (visto na pratica: pagina unica de 6,6MB virou
+    # documento final de 183MB sem essas flags).
+    doc_principal.save(output_path, garbage=4, deflate=True)
+    doc_principal.close()
+    texto_tmp.unlink(missing_ok=True)
+    imagem_tmp.unlink(missing_ok=True)
+
+    return indices_sem_texto
+
+
 # ---------------------------------------------------------------------------
 # DOCX
 # ---------------------------------------------------------------------------
