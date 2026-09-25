@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import tempfile
+from collections import Counter
 from pathlib import Path
 from typing import Callable
 
@@ -52,6 +53,18 @@ Regras obrigatorias:
 - Preserve EXATAMENTE como estao, sem traduzir nem converter: numeros, percentuais, \
 codigos (CAS, ONU, NCM), siglas, unidades de medida (mg, g, kg, km, %, degC etc.) e \
 nomes de produto/marca.
+- Atencao especial: um nome curto entre aspas logo depois de "nosso", "nossa", \
+"chamado(a)", "conhecido(a) como" ou similar e quase sempre nome proprio (marca, \
+mascote, produto) mesmo que as palavras, isoladas, tenham traducao literal obvia (ex.: \
+"nosso \"Gato Mia\"" preserva "Gato Mia" tal como esta, NAO traduz pra "Cat Mia" ou \
+"Cat Meow" so porque "gato" e "mia" tem traducao).
+- Cada item da lista e INDEPENDENTE. A presenca de nomes de marca/produto em outros \
+itens do MESMO lote nao significa que este item tambem deva ficar sem traduzir — \
+traduza normalmente qualquer item que seja frase, chamada ou slogan de verdade, mesmo \
+que esteja do lado de nomes de marca, telefone ou site no lote (ex.: um lote com \
+"GATO MIA", "Naturalle", "Amor em cada detalhe" e um telefone: os tres primeiros sao \
+nome/marca e ficam como estao, mas "Amor em cada detalhe" e slogan de verdade e DEVE \
+ser traduzido).
 - Nao adicione nem remova informacao. Nao resuma. Nao comente.
 - Mantenha quebras de linha internas do item quando fizerem sentido.
 - Se um item nao tiver texto traduzivel (so numero, so pontuacao, vazio), devolva o \
@@ -156,11 +169,93 @@ def translate_batch(
             return out
         print(f"[aviso] tentativa {attempt + 1}: esperava {len(texts)} traducoes, recebi {len(out)} — repetindo")
 
-    # Ainda inconsistente apos repetir: preenche com o original pra nao
-    # derrubar o pipeline inteiro por causa de 1-2 itens problematicos.
-    print(f"[aviso] mantendo divergencia de contagem — completando com o texto original onde faltar")
-    fixed = list(out) + texts[len(out):]
-    return fixed[: len(texts)]
+    # Ainda inconsistente apos repetir em lote: traduz item por item (1 por
+    # chamada). Mais lento/caro so pra esses poucos itens problematicos, mas
+    # garante correspondencia 1:1 -- o fallback antigo ("out +
+    # texts[len(out):]") assumia que o item que faltou era sempre o
+    # ULTIMO da lista; quando o modelo funde/pula um item no MEIO, tudo
+    # depois dele desalinha e texto original vaza sem traducao, em
+    # silencio, mesmo em paginas que pareciam ok. Achado real na pagina 1
+    # do "Gato Mia" (ver claude-sessions-log/sessions/2026-09-24_tradutor-
+    # pagamento-corrigido-upload-storage-e-classificador-marca.md).
+    print("[aviso] mantendo divergencia de contagem apos repetir em lote — traduzindo item por item")
+    resultado = []
+    for texto in texts:
+        item_out, usage_item = _call_translate([texto], source_lang, target_lang)
+        if on_uso:
+            on_uso(usage_item)
+        resultado.append(item_out[0] if item_out else texto)
+    return resultado
+
+
+def _parece_espacamento_artificial(texto: str) -> bool:
+    """Deteta fonte de titulo com tracking largo (comum em capa/ficha
+    tecnica feita no Canva) que grava espaco real entre CADA letra no PDF,
+    nao so um efeito visual de kerning -- extracao normal devolve "N o s s
+    o" em vez de "Nosso". Sem tratar isso antes de traduzir, o texto nao
+    parece prosa e o modelo devolve inalterado (sem avisar ninguem).
+    Achado real no arquivo "Gato Mia" (titulo de capa e ficha tecnica), ver
+    claude-sessions-log/sessions/2026-09-25_tradutor-*.md. True quando a
+    maioria dos "tokens" (separados por espaco simples) tem so 1
+    caractere."""
+    tokens = texto.split(" ")
+    if len(tokens) < 4:
+        return False
+    tokens_1_char = sum(1 for t in tokens if len(t) == 1)
+    return tokens_1_char / len(tokens) > 0.6
+
+
+def _colapsar_espacamento_artificial(texto: str) -> str:
+    """Fallback ingenuo: cola tudo, sem tentar recuperar onde ficavam as
+    palavras de verdade (usado quando nao da pra checar a posicao real dos
+    caracteres, ver _texto_traduzivel). Espaco DUPLO continua respeitado
+    como separador de palavra de verdade, caso a mesma fonte tambem use
+    espaco duplo entre palavras reais."""
+    return texto.replace("  ", "\x00").replace(" ", "").replace("\x00", " ")
+
+
+LIMIAR_GAP_ESPACO_REAL_PT = 1.5
+
+
+def _texto_traduzivel(page: fitz.Page, texto: str, bbox: tuple) -> str:
+    """Versao boa do fallback acima: quando o texto parece ter
+    espacamento artificial (_parece_espacamento_artificial), reconstroi a
+    pontuacao real das palavras usando a POSICAO de cada caractere
+    (rawdict) em vez de so colar tudo -- letras da mesma palavra tem gap
+    ~0 entre si nessa fonte, um espaco de palavra de verdade tem gap bem
+    maior (medido na pratica: ~6pt vs 0pt). Sem isso, colar tudo (ex.:
+    "nossaareia" em vez de "nossa areia") as vezes o modelo reconstroi
+    sozinho, as vezes nao -- achado real na ficha tecnica do arquivo "Gato
+    Mia" (ver claude-sessions-log/sessions/2026-09-25_tradutor-*.md)."""
+    if not _parece_espacamento_artificial(texto):
+        return texto
+    chars = []
+    for b in page.get_text("rawdict", clip=fitz.Rect(bbox)).get("blocks", []):
+        if b.get("type") != 0:
+            continue
+        for line in b["lines"]:
+            for span in line["spans"]:
+                chars.extend(span["chars"])
+    visiveis = [c for c in chars if c["c"] != " "]
+    if len(visiveis) < 4:
+        return _colapsar_espacamento_artificial(texto)
+    gaps = [visiveis[i]["bbox"][0] - visiveis[i - 1]["bbox"][2] for i in range(1, len(visiveis))]
+    # Limiar adaptativo: fontes diferentes tem magnitude de tracking bem
+    # diferente entre si (medido na pratica: uma fonte com gap ~0pt entre
+    # letras da mesma palavra, outra com gap ~6pt uniforme entre TODAS as
+    # letras, onde so o espaco de palavra de verdade destoa, ~22pt). Um
+    # limiar fixo funciona pra uma e falha pra outra -- compara cada gap
+    # com a MEDIANA dos gaps da propria linha (aproxima o tracking normal
+    # daquela fonte) em vez de um valor absoluto.
+    gaps_ordenados = sorted(gaps)
+    mediana = gaps_ordenados[len(gaps_ordenados) // 2]
+    limiar = max(LIMIAR_GAP_ESPACO_REAL_PT, mediana * 2.5)
+    partes = [visiveis[0]["c"]]
+    for i, gap in enumerate(gaps, start=1):
+        if gap > limiar:
+            partes.append(" ")
+        partes.append(visiveis[i]["c"])
+    return "".join(partes)
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +282,25 @@ def _mesclar_linhas_mesma_altura(raw_lines: list[dict]) -> list[dict]:
             sobreposicao = min(y1, ay1) - max(y0, ay0)
             altura_min = min(y1 - y0, ay1 - ay0)
             if altura_min > 0 and sobreposicao / altura_min > 0.5:
+                # Garante espaco na juncao: essa funcao serve pra reunir
+                # fragmentos da MESMA linha visual (letra solta por causa
+                # de tracking largo), mas o limiar de sobreposicao vertical
+                # tambem pode confundir duas linhas DIFERENTES e genuinas
+                # (ex.: "Mais conforto" / "para as patinhas" em 2 linhas)
+                # quando a fonte e grande o bastante pra bbox de uma
+                # encostar na de baixo. Sem isso, o span final fica colado
+                # ("Mais confortopara as patinhas") -- um espaco extra
+                # nunca quebra a traducao, faltar um sempre corrompe.
+                # Achado real na ficha tecnica do arquivo "Gato Mia" (ver
+                # claude-sessions-log/sessions/2026-09-25_tradutor-*.md).
+                if (
+                    atual["spans"]
+                    and line["spans"]
+                    and not atual["spans"][-1]["text"].endswith((" ", "\n"))
+                    and not line["spans"][0]["text"].startswith((" ", "\n"))
+                ):
+                    ultimo = atual["spans"][-1]
+                    atual["spans"] = atual["spans"][:-1] + [{**ultimo, "text": ultimo["text"] + " "}]
                 atual["spans"] = atual["spans"] + line["spans"]
                 atual["bbox"] = (
                     min(atual["bbox"][0], line["bbox"][0]),
@@ -254,35 +368,40 @@ def _dividir_em_subblocos(
 
 _MARCADORES_SOLTOS = {"•", "·", "●", "○", "▪", "‣", "◦", "-", "*"}
 
-# Area minima (pt^2) pra um retangulo preenchido contar como "fundo
-# colorido de verdade" (banner de secao, destaque) — evita que um icone ou
-# elemento pequeno qualquer seja confundido com fundo de texto.
-AREA_MINIMA_FUNDO_COLORIDO = 500
+def _cor_fundo_real(pix: fitz.Pixmap, bbox: fitz.Rect) -> tuple:
+    """Acha a cor de fundo REAL nessa posicao da pagina, amostrando pixel
+    do render (renderizado ANTES de qualquer redacao) em vez de tentar
+    adivinhar por geometria de forma (area, z-order) qual retangulo/path
+    esta "por cima". A heuristica antiga (menor area contendo o centro do
+    bloco) causou uma serie de bugs reais no arquivo "Gato Mia": pagina
+    inteira preta (celula de tabela fantasma cobrindo um retangulo preto
+    decorativo), texto branco invisivel sobre fundo branco escolhido por
+    engano, e um logo (arte vetorial complexa com 1000+ curvas) apagado
+    por um retangulo branco pequeno enterrado embaixo dele (opaco mas
+    coberto por outros elementos — nao dava pra saber isso sem renderizar
+    de verdade). Amostrar o pixel renderizado sempre acerta, nao importa
+    quantas formas sobrepostas existam. Ver claude-sessions-log/sessions/
+    2026-09-25_tradutor-*.md.
 
-
-def _mapear_fundos_coloridos(page: fitz.Page) -> list[tuple[fitz.Rect, tuple]]:
-    """Lista os retangulos preenchidos grandes da pagina (banners de secao,
-    faixas de destaque etc.) — usado pra saber, antes de redatar um bloco de
-    texto, se ele esta em cima de uma cor de fundo diferente de branco."""
-    return [
-        (fitz.Rect(d["rect"]), d["fill"])
-        for d in page.get_drawings()
-        if d.get("type") == "f" and d.get("fill") and fitz.Rect(d["rect"]).get_area() > AREA_MINIMA_FUNDO_COLORIDO
+    Amostra pontos logo FORA da bbox (nao dentro, pra nao pegar pixel do
+    proprio texto original) e usa a cor mais comum entre eles."""
+    margem = 3
+    meio_x = (bbox.x0 + bbox.x1) / 2
+    meio_y = (bbox.y0 + bbox.y1) / 2
+    candidatos = [
+        (meio_x, bbox.y0 - margem),
+        (meio_x, bbox.y1 + margem),
+        (bbox.x0 - margem, meio_y),
+        (bbox.x1 + margem, meio_y),
     ]
-
-
-def _cor_fundo_do_bloco(bbox: fitz.Rect, fundos: list[tuple[fitz.Rect, tuple]]) -> tuple:
-    """Acha o retangulo de fundo colorido mais especifico (menor area) que
-    cobre o centro do bloco, pra redatar com essa cor em vez de branco fixo
-    — senao a redacao apaga um banner colorido (ex.: cabecalho de secao com
-    fundo azul e texto branco) e deixa um buraco branco, ou pior, texto
-    branco reinserido sobre fundo branco (invisivel)."""
-    centro = fitz.Point((bbox.x0 + bbox.x1) / 2, (bbox.y0 + bbox.y1) / 2)
-    melhor: tuple[fitz.Rect, tuple] | None = None
-    for rect, cor in fundos:
-        if rect.contains(centro) and (melhor is None or rect.get_area() < melhor[0].get_area()):
-            melhor = (rect, cor)
-    return melhor[1] if melhor else (1, 1, 1)
+    cores = []
+    for x, y in candidatos:
+        xi, yi = int(x), int(y)
+        if 0 <= xi < pix.width and 0 <= yi < pix.height:
+            cores.append(tuple(c / 255 for c in pix.pixel(xi, yi)[:3]))
+    if not cores:
+        return (1, 1, 1)
+    return Counter(cores).most_common(1)[0][0]
 
 
 def _has_visible_text(lines_runs: list[tuple[list[list], tuple]]) -> bool:
@@ -926,22 +1045,52 @@ def process_pdf(
             if d.get("type") in ("s", "f") and (fitz.Rect(d["rect"]).width < 1 or fitz.Rect(d["rect"]).height < 1)
         ]
 
-        # Banners/faixas de destaque (fundo colorido, tipo cabecalho de
-        # secao) — pra redatar o texto que fica em cima delas com a mesma
-        # cor do fundo, nao com branco fixo (senao apaga o banner colorido
-        # e, se o texto original era branco, o texto novo fica invisivel
-        # em cima do branco que sobrou).
-        fundos_coloridos = _mapear_fundos_coloridos(page)
+        # Render da pagina ANTES de qualquer redacao -- usado por
+        # _cor_fundo_real pra saber a cor de fundo de verdade em cada
+        # ponto (ver docstring da funcao pro porque nao confiar em
+        # geometria de forma). dpi=72 faz 1pt = 1px, mapeando direto pras
+        # coordenadas de bbox que ja usamos no resto do arquivo.
+        pix_fundo = page.get_pixmap(dpi=72)
 
         # Detecta tabelas de verdade (pelas linhas do desenho) pra nao deixar
         # o agrupamento generico de texto misturar conteudo de celulas vizinhas.
+        #
+        # find_tables() pode confundir retangulos de fundo decorativos (ex:
+        # uma "moldura" atras de uma foto) com grade de tabela e devolver
+        # uma unica celula gigante cobrindo a pagina inteira -- uma celula
+        # real nunca ocupa a maior parte da propria tabela (precisa de pelo
+        # menos 2 linhas/colunas pra ser tabela de verdade). Quando isso
+        # acontece, a celula gigante vira um redact_annot do tamanho da
+        # pagina, redatado com a cor do fundo mais especifico por baixo
+        # (podendo ser preto/escuro de um elemento decorativo) — apagando a
+        # pagina inteira. Achado real numa pagina de capa (foto + titulo,
+        # sem tabela nenhuma) do arquivo "Gato Mia", ver claude-sessions-
+        # log/sessions/2026-09-25_tradutor-*.md. Ignora a tabela inteira
+        # nesse caso (nao so a celula suspeita) — o texto cai no caminho
+        # normal de blocos, mais seguro (redacao no bbox do proprio texto).
+        # find_tables() tambem pode inventar uma grade plausivel de VARIAS
+        # celulas normais (nenhuma delas gigante) só pelo alinhamento de
+        # texto/icones da pagina, mesmo sem nenhuma linha de grade
+        # desenhada de verdade — visto na pratica numa ficha tecnica cheia
+        # de selos/icones (sem tabela nenhuma), gerando celulas que se
+        # sobrepoem parcialmente com blocos de texto normais e duplicam
+        # trecho traduzido. `linhas_finas` (abaixo) ja detecta separador/
+        # borda fina de verdade; se a pagina nao tem NENHUMA, uma tabela
+        # "encontrada" aqui e quase certamente essa mesma alucinacao —
+        # ignora todas nesse caso.
+        tem_linha_de_grade_de_verdade = any(
+            d.get("type") in ("s", "f") and (fitz.Rect(d["rect"]).width < 1 or fitz.Rect(d["rect"]).height < 1)
+            for d in page.get_drawings()
+        )
         table_cell_rects: list[fitz.Rect] = []
         table_areas: list[fitz.Rect] = []
-        for table in page.find_tables().tables:
-            table_areas.append(fitz.Rect(table.bbox))
-            for cell_bbox in table.cells:
-                if cell_bbox:
-                    table_cell_rects.append(fitz.Rect(cell_bbox))
+        for table in (page.find_tables().tables if tem_linha_de_grade_de_verdade else []):
+            tbbox = fitz.Rect(table.bbox)
+            celulas = [fitz.Rect(c) for c in table.cells if c]
+            if any(c.get_area() > tbbox.get_area() * 0.6 for c in celulas):
+                continue
+            table_areas.append(tbbox)
+            table_cell_rects.extend(celulas)
 
         block_infos = []
         flat_originals = []  # todos os runs de texto da pagina, na ordem
@@ -959,10 +1108,10 @@ def process_pdf(
             if not lines_runs or not _has_visible_text(lines_runs):
                 continue
             run_indices = []
-            for line_runs, _bbox in lines_runs:
+            for line_runs, linha_bbox in lines_runs:
                 for run in line_runs:
                     run_indices.append(len(flat_originals))
-                    flat_originals.append(run[0])
+                    flat_originals.append(_texto_traduzivel(page, run[0], linha_bbox))
             block_infos.append(
                 {
                     "bbox": tuple(cell_rect),
@@ -999,10 +1148,10 @@ def process_pdf(
                     max(bbox[3] for _r, bbox in subgrupo),
                 )
                 run_indices = []
-                for line_runs, _bbox in subgrupo:
+                for line_runs, linha_bbox in subgrupo:
                     for run in line_runs:
                         run_indices.append(len(flat_originals))
-                        flat_originals.append(run[0])
+                        flat_originals.append(_texto_traduzivel(page, run[0], linha_bbox))
                 block_infos.append(
                     {
                         "bbox": bbox_subgrupo,
@@ -1030,7 +1179,7 @@ def process_pdf(
         # originais se encostam/leve sobreposicao de bbox).
         for info in block_infos:
             bbox = fitz.Rect(info.get("bbox_redacao", info["bbox"]))
-            cor_fundo = _cor_fundo_do_bloco(bbox, fundos_coloridos)
+            cor_fundo = _cor_fundo_real(pix_fundo, bbox)
             page.add_redact_annot(bbox, fill=cor_fundo)
         page.apply_redactions()
 
