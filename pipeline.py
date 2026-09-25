@@ -217,36 +217,25 @@ def _colapsar_espacamento_artificial(texto: str) -> str:
 LIMIAR_GAP_ESPACO_REAL_PT = 1.5
 
 
-def _texto_traduzivel(page: fitz.Page, texto: str, bbox: tuple) -> str:
-    """Versao boa do fallback acima: quando o texto parece ter
-    espacamento artificial (_parece_espacamento_artificial), reconstroi a
-    pontuacao real das palavras usando a POSICAO de cada caractere
-    (rawdict) em vez de so colar tudo -- letras da mesma palavra tem gap
-    ~0 entre si nessa fonte, um espaco de palavra de verdade tem gap bem
-    maior (medido na pratica: ~6pt vs 0pt). Sem isso, colar tudo (ex.:
-    "nossaareia" em vez de "nossa areia") as vezes o modelo reconstroi
-    sozinho, as vezes nao -- achado real na ficha tecnica do arquivo "Gato
-    Mia" (ver claude-sessions-log/sessions/2026-09-25_tradutor-*.md)."""
-    if not _parece_espacamento_artificial(texto):
-        return texto
-    chars = []
-    for b in page.get_text("rawdict", clip=fitz.Rect(bbox)).get("blocks", []):
-        if b.get("type") != 0:
-            continue
-        for line in b["lines"]:
-            for span in line["spans"]:
-                chars.extend(span["chars"])
+def _reconstruir_espacamento_por_posicao(chars: list[dict]) -> str:
+    """Parte pura (sem PDF) de _texto_traduzivel: recebe caracteres no
+    formato do rawdict do PyMuPDF (cada um {"c": <char>, "bbox": (x0, y0,
+    x1, y1)}) e reconstroi onde ficavam os espacos de palavra de verdade
+    usando o GAP horizontal entre caracteres visiveis consecutivos.
+
+    Limiar adaptativo: fontes diferentes tem magnitude de tracking bem
+    diferente entre si (medido na pratica: uma fonte com gap ~0pt entre
+    letras da mesma palavra e ~6pt no espaco de palavra; outra com gap
+    ~6pt uniforme entre TODAS as letras, onde so o espaco de palavra de
+    verdade destoa, ~22pt). Um limiar fixo funciona pra uma e falha pra
+    outra -- compara cada gap com a MEDIANA dos gaps da propria linha
+    (aproxima o tracking normal daquela fonte) em vez de um valor
+    absoluto. Devolve None quando nao ha caracteres visiveis suficientes
+    pra uma mediana confiavel (quem chama decide o fallback)."""
     visiveis = [c for c in chars if c["c"] != " "]
     if len(visiveis) < 4:
-        return _colapsar_espacamento_artificial(texto)
+        return None
     gaps = [visiveis[i]["bbox"][0] - visiveis[i - 1]["bbox"][2] for i in range(1, len(visiveis))]
-    # Limiar adaptativo: fontes diferentes tem magnitude de tracking bem
-    # diferente entre si (medido na pratica: uma fonte com gap ~0pt entre
-    # letras da mesma palavra, outra com gap ~6pt uniforme entre TODAS as
-    # letras, onde so o espaco de palavra de verdade destoa, ~22pt). Um
-    # limiar fixo funciona pra uma e falha pra outra -- compara cada gap
-    # com a MEDIANA dos gaps da propria linha (aproxima o tracking normal
-    # daquela fonte) em vez de um valor absoluto.
     gaps_ordenados = sorted(gaps)
     mediana = gaps_ordenados[len(gaps_ordenados) // 2]
     limiar = max(LIMIAR_GAP_ESPACO_REAL_PT, mediana * 2.5)
@@ -256,6 +245,27 @@ def _texto_traduzivel(page: fitz.Page, texto: str, bbox: tuple) -> str:
             partes.append(" ")
         partes.append(visiveis[i]["c"])
     return "".join(partes)
+
+
+def _texto_traduzivel(page: fitz.Page, texto: str, bbox: tuple) -> str:
+    """Quando o texto parece ter espacamento artificial
+    (_parece_espacamento_artificial), reconstroi a pontuacao real das
+    palavras usando a POSICAO de cada caractere (rawdict) em vez de so
+    colar tudo (ver _reconstruir_espacamento_por_posicao). Sem isso,
+    colar tudo (ex.: "nossaareia" em vez de "nossa areia") as vezes o
+    modelo reconstroi sozinho, as vezes nao -- achado real na ficha
+    tecnica do arquivo "Gato Mia" (ver claude-sessions-log/sessions/2026-
+    09-25_tradutor-*.md)."""
+    if not _parece_espacamento_artificial(texto):
+        return texto
+    chars = []
+    for b in page.get_text("rawdict", clip=fitz.Rect(bbox)).get("blocks", []):
+        if b.get("type") != 0:
+            continue
+        for line in b["lines"]:
+            for span in line["spans"]:
+                chars.extend(span["chars"])
+    return _reconstruir_espacamento_por_posicao(chars) or _colapsar_espacamento_artificial(texto)
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +377,29 @@ def _dividir_em_subblocos(
 
 
 _MARCADORES_SOLTOS = {"•", "·", "●", "○", "▪", "‣", "◦", "-", "*"}
+
+def _eh_linha_fina(d: dict) -> bool:
+    """Retangulo fino (linha divisoria/separador/borda de tabela de
+    verdade), nao um bloco de conteudo -- largura OU altura menor que
+    1pt."""
+    return d.get("type") in ("s", "f") and (fitz.Rect(d["rect"]).width < 1 or fitz.Rect(d["rect"]).height < 1)
+
+
+def _tabela_parece_real(tbbox: fitz.Rect, celulas: list[fitz.Rect]) -> bool:
+    """False quando alguma celula ocupa a maior parte da propria tabela --
+    sinal de grade inventada por find_tables() (fundo decorativo ou
+    alinhamento de texto/icones lido como grade), nao tabela de verdade:
+    uma celula real nunca domina a tabela inteira sozinha, precisa de
+    pelo menos 2 linhas/colunas pra existir. Achado real no arquivo "Gato
+    Mia" (ver claude-sessions-log/sessions/2026-09-25_tradutor-*.md) --
+    tanto uma celula unica cobrindo a pagina inteira quanto uma grade de
+    varias celulas normais sem nenhuma linha de grade desenhada de
+    verdade (ver _eh_linha_fina, usado por quem chama antes de sequer
+    tentar find_tables())."""
+    if not celulas:
+        return False
+    return not any(c.get_area() > tbbox.get_area() * 0.6 for c in celulas)
+
 
 def _cor_fundo_real(pix: fitz.Pixmap, bbox: fitz.Rect) -> tuple:
     """Acha a cor de fundo REAL nessa posicao da pagina, amostrando pixel
@@ -1039,11 +1072,7 @@ def process_pdf(
         # traco ("s") quanto como retangulo fino preenchido ("f") — guarda os
         # dois tipos agora pra redesenhar depois de inserir o texto, do mesmo
         # jeito que a borda de tabela.
-        linhas_finas = [
-            d
-            for d in page.get_drawings()
-            if d.get("type") in ("s", "f") and (fitz.Rect(d["rect"]).width < 1 or fitz.Rect(d["rect"]).height < 1)
-        ]
+        linhas_finas = [d for d in page.get_drawings() if _eh_linha_fina(d)]
 
         # Render da pagina ANTES de qualquer redacao -- usado por
         # _cor_fundo_real pra saber a cor de fundo de verdade em cada
@@ -1077,17 +1106,14 @@ def process_pdf(
         # trecho traduzido. `linhas_finas` (abaixo) ja detecta separador/
         # borda fina de verdade; se a pagina nao tem NENHUMA, uma tabela
         # "encontrada" aqui e quase certamente essa mesma alucinacao —
-        # ignora todas nesse caso.
-        tem_linha_de_grade_de_verdade = any(
-            d.get("type") in ("s", "f") and (fitz.Rect(d["rect"]).width < 1 or fitz.Rect(d["rect"]).height < 1)
-            for d in page.get_drawings()
-        )
+        # ignora todas nesse caso. Reusa `linhas_finas` (ja calculado
+        # acima) como evidencia de linha de grade de verdade.
         table_cell_rects: list[fitz.Rect] = []
         table_areas: list[fitz.Rect] = []
-        for table in (page.find_tables().tables if tem_linha_de_grade_de_verdade else []):
+        for table in (page.find_tables().tables if linhas_finas else []):
             tbbox = fitz.Rect(table.bbox)
             celulas = [fitz.Rect(c) for c in table.cells if c]
-            if any(c.get_area() > tbbox.get_area() * 0.6 for c in celulas):
+            if not _tabela_parece_real(tbbox, celulas):
                 continue
             table_areas.append(tbbox)
             table_cell_rects.extend(celulas)

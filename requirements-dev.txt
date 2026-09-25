@@ -1,0 +1,4 @@
+# Dependencias só de teste/dev -- nunca instaladas na imagem Docker de
+# produção (requirements.txt continua só com o necessário pra rodar).
+-r requirements.txt
+pytest>=8.0
