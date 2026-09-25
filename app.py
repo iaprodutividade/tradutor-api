@@ -414,6 +414,53 @@ def _preview_docx(origem: Path, tmp: Path, idioma_origem: str, idioma_destino: s
     }
 
 
+# Limite bem mais alto que o do endpoint /preview (multipart) de proposito:
+# esse aqui recebe so o CAMINHO no Storage, o arquivo em si nunca passa pelo
+# Vercel -- que tem um limite fixo de ~4,5MB por requisicao de funcao
+# serverless, nao configuravel, descoberto testando um catalogo real de 11MB
+# em 25/09/2026 (o proprio /preview multipart nunca teria funcionado pra
+# esse arquivo, mesmo estando dentro do limite de 15MB do app). 50MB cobre
+# catalogos/apresentacoes reais com folga.
+MAX_TAMANHO_ARQUIVO_STORAGE = 50 * 1024 * 1024
+
+
+class PreviewStorageBody(BaseModel):
+    arquivo_original_path: str
+    idioma_origem: str
+    idioma_destino: str
+
+
+@app.post("/preview-do-storage")
+async def preview_do_storage(
+    request: Request,
+    body: PreviewStorageBody,
+    x_api_key: str | None = Header(default=None),
+):
+    """Mesma logica do /preview, mas pro arquivo ja estar no Storage (subido
+    direto do navegador via URL assinada) em vez de vir por upload multipart
+    direto nessa requisicao -- ver MAX_TAMANHO_ARQUIVO_STORAGE."""
+    _checar_api_key(x_api_key)
+    _checar_rate_limit(_ip_do_cliente(request))
+    if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Supabase não configurado no backend.")
+
+    sufixo = Path(body.arquivo_original_path).suffix.lower()
+    if sufixo not in (".pdf", ".docx", ".jpg", ".jpeg", ".png", ".webp"):
+        raise HTTPException(status_code=400, detail="Só aceitamos .pdf, .docx, .jpg, .jpeg, .png ou .webp")
+
+    conteudo = _baixar_do_storage(body.arquivo_original_path)
+    if len(conteudo) > MAX_TAMANHO_ARQUIVO_STORAGE:
+        raise HTTPException(status_code=413, detail="Arquivo muito grande (limite de 50 MB).")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        origem = Path(tmp) / f"origem{sufixo}"
+        origem.write_bytes(conteudo)
+
+        if sufixo == ".docx":
+            return _preview_docx(origem, Path(tmp), body.idioma_origem, body.idioma_destino)
+        return _preview_pdf(origem, Path(tmp), body.idioma_origem, body.idioma_destino)
+
+
 # ---------------------------------------------------------------------------
 # Processamento completo (pos-pagamento) — chamado pelo webhook do Mercado
 # Pago em tradutor-web. Le/grava direto no Supabase (Storage + tabela jobs)
@@ -454,7 +501,11 @@ def _atualizar_job(job_id: str, campos: dict):
 
 
 def _baixar_do_storage(path: str) -> bytes:
-    resp = httpx.get(f"{SUPABASE_URL}/storage/v1/object/{BUCKET_ARQUIVOS}/{path}", headers=_supabase_headers(), timeout=120)
+    # timeout generoso (180s) -- desde 25/09/2026 arquivos de ate 50MB passam
+    # por aqui direto na chamada sincrona de /preview-do-storage (nao so em
+    # BackgroundTasks como antes), entao uma rede mais lenta nao pode estourar
+    # o timeout no meio de um download real.
+    resp = httpx.get(f"{SUPABASE_URL}/storage/v1/object/{BUCKET_ARQUIVOS}/{path}", headers=_supabase_headers(), timeout=180)
     resp.raise_for_status()
     return resp.content
 
@@ -470,7 +521,7 @@ def _subir_para_storage(path: str, conteudo: bytes, content_type: str):
         f"{SUPABASE_URL}/storage/v1/object/{BUCKET_ARQUIVOS}/{path}",
         headers={**_supabase_headers(content_type), "x-upsert": "true"},
         content=conteudo,
-        timeout=120,
+        timeout=180,
     )
     resp.raise_for_status()
 
