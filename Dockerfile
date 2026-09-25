@@ -15,11 +15,15 @@ RUN groupadd -r tradutor && useradd -r -g tradutor tradutor
 # paddleocr/paddlex) precisa do libGL mesmo rodando sem interface grafica
 # nenhuma — sem isso quebra com "ImportError: libGL.so.1: cannot open
 # shared object file" ao importar o paddleocr.
+# ghostscript: comprime PDF grande (catalogo/apresentacao >40MB) antes do
+# upload pro Supabase Storage, que tem teto fixo de 50MB no plano Free
+# (ver comprimir_pdf em pipeline.py). Pacote leve, nao afeta o tamanho da
+# imagem de forma relevante perto do resto do stack.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-writer fonts-crosextra-carlito fonts-crosextra-caladea \
     build-essential zlib1g-dev libjpeg-dev libpng-dev libfreetype6-dev \
     liblcms2-dev libopenjp2-7-dev libtiff-dev libwebp-dev \
-    libgl1 libglib2.0-0 \
+    libgl1 libglib2.0-0 ghostscript \
     && rm -rf /var/lib/apt/lists/*
 COPY fontconfig/29-aptos-substitute.conf /etc/fonts/conf.d/29-aptos-substitute.conf
 RUN fc-cache -f

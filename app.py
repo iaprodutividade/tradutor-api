@@ -15,13 +15,14 @@ import fitz  # pymupdf
 import httpx
 from docx import Document
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile, Header
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile, Header, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from pipeline import (
     _aplicar_traducao_em_paragrafos,
     analisar_texto_extraivel,
+    comprimir_pdf,
     custo_centavos_brl,
     detectar_elementos_repetidos,
     gerar_imagem_previa_docx,
@@ -460,6 +461,68 @@ async def preview_do_storage(
         if sufixo == ".docx":
             return _preview_docx(origem, Path(tmp), body.idioma_origem, body.idioma_destino)
         return _preview_pdf(origem, Path(tmp), body.idioma_origem, body.idioma_destino)
+
+
+# Alvo com margem de seguranca abaixo do teto de 50MB do Supabase Storage
+# (plano Free) -- nao mira exatamente 50MB pra sobrar folga (metadado do
+# objeto, variacao de tamanho entre tentativas do Ghostscript etc.).
+ALVO_COMPRESSAO_BYTES = 45 * 1024 * 1024
+# Nao aceita qualquer coisa absurda nesse endpoint -- o navegador so chama
+# ele pra arquivo que JA passou de MAX_TAMANHO_ARQUIVO_STORAGE (50MB), um
+# teto bem mais alto aqui e so pra rejeitar upload claramente fora do
+# esperado (bug no frontend, abuso etc.), nao pra ser um limite reasoavel
+# em si.
+MAX_TAMANHO_ARQUIVO_COMPRESSAO = 300 * 1024 * 1024
+
+
+@app.post("/comprimir")
+async def comprimir(
+    request: Request,
+    arquivo: UploadFile = File(...),
+    x_api_key: str | None = Header(default=None),
+):
+    """Recebe um PDF grande direto do navegador -- ANTES dele subir pro
+    Storage, nao depois: o upload direto pro Storage (URL assinada) falha
+    sozinho pra arquivo acima de 50MB (teto do plano Free), entao o
+    backend nunca chegaria a ver esse arquivo se a compressao acontecesse
+    so depois. O frontend chama esse endpoint quando o arquivo passa de
+    MAX_TAMANHO_ARQUIVO_STORAGE, e so sobe pro Storage o resultado
+    (comprimido) daqui, pelo fluxo normal de URL assinada.
+
+    Mesmo motivo do /preview-do-storage pra nao ir pelo Vercel: aqui o
+    arquivo grande ainda esta so no navegador, nunca passou pelo Storage
+    -- se fosse rotear pelo Next.js/Vercel, esbarraria no mesmo limite de
+    ~4,5MB por requisicao de funcao serverless que motivou o upload
+    direto pro Storage em primeiro lugar."""
+    _checar_api_key(x_api_key)
+    _checar_rate_limit(_ip_do_cliente(request))
+
+    if Path(arquivo.filename or "").suffix.lower() != ".pdf":
+        raise HTTPException(status_code=400, detail="Compressão automática só é aplicável a PDF.")
+
+    conteudo = await arquivo.read()
+    if len(conteudo) > MAX_TAMANHO_ARQUIVO_COMPRESSAO:
+        raise HTTPException(status_code=413, detail="Arquivo grande demais mesmo para tentar comprimir.")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        origem = Path(tmp) / "origem.pdf"
+        origem.write_bytes(conteudo)
+        destino = Path(tmp) / "comprimido.pdf"
+
+        coube_no_alvo = comprimir_pdf(origem, destino, ALVO_COMPRESSAO_BYTES)
+        if not destino.exists():
+            raise HTTPException(status_code=500, detail="Falha ao comprimir o PDF (Ghostscript indisponível ou arquivo inválido).")
+
+        resultado_bytes = destino.read_bytes()
+
+    return Response(
+        content=resultado_bytes,
+        media_type="application/pdf",
+        # O frontend confere esse header pra saber se precisa avisar o
+        # usuario que, mesmo comprimido, o arquivo ainda pode nao caber
+        # no limite do Storage (melhor esforco, nao garantia).
+        headers={"X-Coube-No-Alvo": "true" if coube_no_alvo else "false"},
+    )
 
 
 # ---------------------------------------------------------------------------

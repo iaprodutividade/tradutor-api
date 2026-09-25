@@ -1518,6 +1518,54 @@ def gerar_imagem_previa_docx(doc: Document, dpi: int = 150) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Compressao de PDF grande
+#
+# Supabase Storage no plano Free tem um teto fixo de 50MB por arquivo (nao
+# da pra contornar sem upgrade pra Pro) -- um catalogo/apresentacao real
+# maior que isso nem consegue ser enviado pelo navegador, o upload direto
+# pro Storage falha antes do backend sequer ver o arquivo. Ghostscript (via
+# CLI, ja testado e robusto pra isso) recomprime as imagens embutidas com
+# os presets padrao dele, do mais leve pro mais agressivo, ate caber no
+# alvo. Decisao de custo-beneficio com o Robson em 25/09/2026.
+# ---------------------------------------------------------------------------
+
+PRESETS_COMPRESSAO_GS = ["/ebook", "/screen"]
+
+
+def comprimir_pdf(input_path: Path, output_path: Path, alvo_bytes: int) -> bool:
+    """Comprime um PDF com Ghostscript, tentando os presets do mais leve
+    (/ebook, ~150dpi, perda de qualidade minima) pro mais agressivo
+    (/screen, ~72dpi) ate o arquivo caber em `alvo_bytes`. Para no
+    primeiro preset que atingir o alvo, sem tentar o resto.
+
+    Devolve True se algum preset coube no alvo. Mesmo quando devolve
+    False, output_path ainda existe com o melhor resultado alcancado (o
+    ultimo preset tentado, o mais agressivo) -- quem chama decide se
+    aceita esse melhor esforco ou rejeita."""
+    for preset in PRESETS_COMPRESSAO_GS:
+        resultado = subprocess.run(
+            [
+                "gs",
+                "-sDEVICE=pdfwrite",
+                "-dCompatibilityLevel=1.4",
+                f"-dPDFSETTINGS={preset}",
+                "-dNOPAUSE",
+                "-dBATCH",
+                "-dQUIET",
+                f"-sOutputFile={output_path}",
+                str(input_path),
+            ],
+            capture_output=True,
+            timeout=180,
+        )
+        if resultado.returncode != 0 or not output_path.exists():
+            continue
+        if output_path.stat().st_size <= alvo_bytes:
+            return True
+    return output_path.exists() and output_path.stat().st_size <= alvo_bytes
+
+
+# ---------------------------------------------------------------------------
 # CLI de teste
 # ---------------------------------------------------------------------------
 

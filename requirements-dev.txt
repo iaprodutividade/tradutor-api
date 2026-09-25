@@ -2,3 +2,4 @@
 # produção (requirements.txt continua só com o necessário pra rodar).
 -r requirements.txt
 pytest>=8.0
+pytest-asyncio>=0.24
