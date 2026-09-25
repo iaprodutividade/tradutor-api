@@ -479,7 +479,6 @@ MAX_TAMANHO_ARQUIVO_COMPRESSAO = 300 * 1024 * 1024
 async def comprimir(
     request: Request,
     arquivo: UploadFile = File(...),
-    x_api_key: str | None = Header(default=None),
 ):
     """Recebe um PDF grande direto do navegador -- ANTES dele subir pro
     Storage, nao depois: o upload direto pro Storage (URL assinada) falha
@@ -493,8 +492,15 @@ async def comprimir(
     arquivo grande ainda esta so no navegador, nunca passou pelo Storage
     -- se fosse rotear pelo Next.js/Vercel, esbarraria no mesmo limite de
     ~4,5MB por requisicao de funcao serverless que motivou o upload
-    direto pro Storage em primeiro lugar."""
-    _checar_api_key(x_api_key)
+    direto pro Storage em primeiro lugar.
+
+    SEM checagem de API key de proposito (unico endpoint assim) -- pra
+    ser chamado direto do navegador sem expor TRADUTOR_API_KEY no
+    bundle do cliente. So rate-limit por IP protege (mesmo padrao do
+    /preview publico): compressao nao chama IA (sem custo de token) nem
+    grava/le nada do Supabase, o pior abuso possivel e gastar CPU de
+    Ghostscript na VPS, que o rate-limit ja contem. Decisao com o
+    Robson em 25/09/2026."""
     _checar_rate_limit(_ip_do_cliente(request))
 
     if Path(arquivo.filename or "").suffix.lower() != ".pdf":
