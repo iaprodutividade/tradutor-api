@@ -84,6 +84,58 @@ def _call_translate(texts: list[str], source_lang: str, target_lang: str) -> tup
     return data["traducoes"], usage
 
 
+CLASSIFICACAO_MARCA_SYSTEM_PROMPT = """Voce recebe uma lista de textos curtos que se \
+repetem identicos em varias paginas de um documento (candidatos a logo/elemento de marca, \
+detectados automaticamente por repeticao). Para cada um, classifique como:
+
+- "marca": nome de empresa, produto, marca, slogan que funciona como parte da identidade \
+visual/logotipo (ex: nome do negocio, "Est. 1998" como selo), ou qualquer texto que nao \
+faria sentido aparecer traduzido porque é uma marca registrada ou nome proprio.
+- "conteudo": frase, chamada, slogan ou texto comum que, mesmo se repetindo em toda \
+pagina como parte do design, é conteudo de verdade e deveria ser traduzido junto com o \
+resto do documento (ex: um slogan/tagline motivacional, uma chamada de rodape).
+
+Na duvida entre as duas, prefira "marca" (mais seguro nao traduzir por engano um nome \
+proprio do que arriscar deixar sem traduzir um texto comum).
+
+Devolva APENAS um JSON com a chave "classificacoes": lista de strings ("marca" ou \
+"conteudo"), na MESMA ORDEM e MESMA QUANTIDADE da lista de entrada."""
+
+
+def _classificar_marca_ou_conteudo(
+    textos: list[str], on_uso: Callable[[dict], None] | None = None
+) -> list[bool]:
+    """True = proteger (é marca/nome, não traduzir), False = é conteúdo comum (traduzir
+    normalmente). Achado num caso real: "GATO MIA" (nome) e "AMOR EM CADA DETALHE"
+    (slogan) apareciam juntos, repetidos em toda página — os dois batiam nos mesmos
+    critérios de "elemento repetido" (curto, poucas palavras), então os dois ficavam
+    protegidos, mesmo o slogan sendo conteúdo de verdade que devia ser traduzido. Sem
+    entender o TEXTO (não só a repetição), não dá pra diferenciar os dois casos."""
+    if not textos:
+        return []
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": CLASSIFICACAO_MARCA_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps({"itens": textos}, ensure_ascii=False)},
+            ],
+            response_format={"type": "json_object"},
+        )
+        if on_uso and resp.usage:
+            on_uso({"prompt_tokens": resp.usage.prompt_tokens, "completion_tokens": resp.usage.completion_tokens})
+        data = json.loads(resp.choices[0].message.content)
+        classificacoes = data.get("classificacoes", [])
+        if len(classificacoes) != len(textos):
+            raise ValueError(f"esperava {len(textos)} classificacoes, recebi {len(classificacoes)}")
+        return [c == "marca" for c in classificacoes]
+    except Exception as e:
+        # Falha na classificacao nunca deve derrubar a deteccao de logo --
+        # comportamento antigo (protege tudo que repete) como fallback seguro.
+        print(f"[aviso] falha ao classificar marca/conteudo, protegendo tudo por seguranca: {e}")
+        return [True] * len(textos)
+
+
 def translate_batch(
     texts: list[str],
     source_lang: str,
@@ -632,6 +684,7 @@ def detectar_elementos_repetidos(
     indices: list[int],
     min_paginas: int = 2,
     on_progress: Callable[[int, int], None] | None = None,
+    on_uso: Callable[[dict], None] | None = None,
 ) -> tuple[dict[int, list[tuple[float, float, float, float]]], dict[int, list[dict]]]:
     """Detecta blocos de texto curtos (até 4 palavras, pelo menos 5
     caracteres) cujo texto se repete em pelo menos `min_paginas` páginas
@@ -659,7 +712,12 @@ def detectar_elementos_repetidos(
     antes essa duplicidade era aceita como custo conhecido; com documentos
     grandes (a detecção roda nas páginas todas do PDF-imagem completo, não
     só numas poucas da prévia) o OCR em dobro passa a ser tempo de verdade
-    numa VPS de CPU limitada, então vale reaproveitar."""
+    numa VPS de CPU limitada, então vale reaproveitar.
+
+    Nem todo elemento repetido é protegido: antes de proteger, cada grupo
+    passa por _classificar_marca_ou_conteudo — repetir em toda página não
+    significa ser logo (um slogan/tagline também repete e deveria ser
+    traduzido, achado num caso real: "GATO MIA" + "AMOR EM CADA DETALHE")."""
     if len(indices) < min_paginas:
         return {}, {}
 
@@ -680,8 +738,8 @@ def detectar_elementos_repetidos(
                 continue
             candidatos.append((i, b, normalizado))
 
-    areas_por_pagina: dict[int, list[tuple[float, float, float, float]]] = {}
     usados = set()
+    grupos_candidatos = []  # [(texto_original, [(pagina, bloco), ...]), ...]
     for idx_a in range(len(candidatos)):
         if idx_a in usados:
             continue
@@ -698,15 +756,26 @@ def detectar_elementos_repetidos(
             paginas_com_match.add(pag_b)
             usados.add(idx_b)
         if len(paginas_com_match) >= min_paginas:
-            for pag, bloco in grupo:
-                areas_por_pagina.setdefault(pag, []).append(
-                    (
-                        bloco["x0"] - MARGEM_PROTECAO_PX,
-                        bloco["y0"] - MARGEM_PROTECAO_PX,
-                        bloco["x1"] + MARGEM_PROTECAO_PX,
-                        bloco["y1"] + MARGEM_PROTECAO_PX,
-                    )
+            grupos_candidatos.append((bloco_a["texto"], grupo))
+
+    # Classifica todos os grupos candidatos numa chamada só (não um por
+    # grupo) -- documento típico tem só um punhado de elementos repetidos,
+    # não vale a pena uma chamada de IA por grupo.
+    eh_marca = _classificar_marca_ou_conteudo([texto for texto, _ in grupos_candidatos], on_uso=on_uso)
+
+    areas_por_pagina: dict[int, list[tuple[float, float, float, float]]] = {}
+    for (_, grupo), protegido in zip(grupos_candidatos, eh_marca):
+        if not protegido:
+            continue
+        for pag, bloco in grupo:
+            areas_por_pagina.setdefault(pag, []).append(
+                (
+                    bloco["x0"] - MARGEM_PROTECAO_PX,
+                    bloco["y0"] - MARGEM_PROTECAO_PX,
+                    bloco["x1"] + MARGEM_PROTECAO_PX,
+                    bloco["y1"] + MARGEM_PROTECAO_PX,
                 )
+            )
     return areas_por_pagina, blocos_por_pagina
 
 

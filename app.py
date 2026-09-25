@@ -607,7 +607,10 @@ def _processar_job_completo(job: dict):
                 total_unificado = len(indices_completos) * 2 if roda_deteccao else len(indices_completos)
                 if roda_deteccao:
                     areas_protegidas, blocos_ocr_cache = detectar_elementos_repetidos(
-                        doc, indices_completos, on_progress=lambda feitas, _total: progresso(feitas, total_unificado)
+                        doc,
+                        indices_completos,
+                        on_progress=lambda feitas, _total: progresso(feitas, total_unificado),
+                        on_uso=registrar_uso,
                     )
                 else:
                     areas_protegidas, blocos_ocr_cache = {}, {}
